@@ -1,7 +1,6 @@
 <template>
   <div class="task-page">
-    <div class="page-header flex-between mb-4">
-      <h2 class="text-xl font-bold m-0">任务中心</h2>
+    <div class="page-toolbar mb-4">
       <el-button :icon="Refresh" @click="fetchTasks">刷新</el-button>
     </div>
 
@@ -204,5 +203,11 @@ onMounted(() => {
 <style scoped>
 .task-page {
   height: 100%;
+}
+
+.page-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
 }
 </style>

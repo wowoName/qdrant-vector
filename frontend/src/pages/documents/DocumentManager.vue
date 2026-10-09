@@ -565,47 +565,48 @@ onMounted(() => {
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: rgba(64, 158, 255, 0.15);
-  border: 4px dashed #409eff;
+  background-color: rgba(61, 125, 255, 0.16);
+  border: 4px dashed #3d7dff;
   z-index: 9999;
   display: flex;
   align-items: center;
   justify-content: center;
   pointer-events: none;
-  backdrop-filter: blur(2px);
+  backdrop-filter: blur(4px);
 }
 
 .drag-overlay-content {
   text-align: center;
-  background-color: rgba(255, 255, 255, 0.95);
+  background-color: rgba(14, 20, 36, 0.96);
+  border: 1px solid var(--vdm-border-strong);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6), var(--vdm-glow);
   padding: 48px 64px;
-  border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  border-radius: 18px;
 }
 
 .drag-text {
   font-size: 20px;
   font-weight: 600;
-  color: #303133;
+  color: var(--vdm-text);
   margin: 16px 0 8px;
 }
 
 .drag-hint {
   font-size: 14px;
-  color: #909399;
+  color: var(--vdm-text-dim);
   margin: 0;
 }
 
 /* 目录面板拖拽高亮 */
 .panel-drag-over {
-  outline: 2px dashed #409eff;
+  outline: 2px dashed #3d7dff;
   outline-offset: -2px;
   border-radius: 4px;
 }
 
 /* 树节点拖拽高亮 */
 .node-drag-over {
-  background-color: rgba(64, 158, 255, 0.2);
+  background-color: rgba(61, 125, 255, 0.24);
   border-radius: 4px;
   padding: 2px 4px;
   margin: -2px -4px;

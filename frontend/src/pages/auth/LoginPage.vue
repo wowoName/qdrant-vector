@@ -1,10 +1,24 @@
 <template>
   <div class="auth-page">
+    <div class="vdm-backdrop"></div>
     <div class="auth-card">
       <div class="auth-logo">
-        <el-icon :size="36" color="#409eff"><Collection /></el-icon>
-        <h1>Vector Data Manager</h1>
-        <p>生产级向量数据库管理平台</p>
+        <div class="auth-mark">
+          <svg viewBox="0 0 48 48" width="30" height="30" aria-hidden="true">
+            <path
+              d="M24 4 41 14v20L24 44 7 34V14z"
+              fill="none"
+              stroke="#ffffff"
+              stroke-width="2.2"
+              stroke-linejoin="round"
+              opacity="0.92"
+            />
+            <circle cx="24" cy="24" r="5.2" fill="#ffffff" />
+            <circle cx="24" cy="24" r="10.4" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1.3" />
+          </svg>
+        </div>
+        <h1>新页</h1>
+        <p>向量数据中枢 · 生产级向量数据库管理平台</p>
       </div>
 
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top" size="large">
@@ -40,7 +54,7 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, FormInstance, FormRules } from 'element-plus'
-import { Collection, Message, Lock } from '@element-plus/icons-vue'
+import { Message, Lock } from '@element-plus/icons-vue'
 import { login } from '@/api/auth'
 import { setAuth } from '@/utils/user'
 
@@ -70,7 +84,7 @@ async function handleLogin() {
     const res = await login({ email: form.email.trim(), password: form.password })
     setAuth(res.token, res.user)
     ElMessage.success('登录成功')
-    router.push('/collections')
+    router.push('/chat')
   } catch {
     // 错误信息由拦截器统一提示
   } finally {
@@ -81,50 +95,83 @@ async function handleLogin() {
 
 <style scoped>
 .auth-page {
+  position: relative;
   min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #e8f1fd 0%, #f5f7fa 100%);
+  background: var(--vdm-void);
+  overflow: hidden;
 }
 
 .auth-card {
-  width: 400px;
-  padding: 40px 36px 28px;
-  background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 8px 30px rgba(0, 30, 80, 0.08);
+  position: relative;
+  z-index: 2;
+  width: 420px;
+  padding: 40px 38px 30px;
+  border-radius: 22px;
+  background: rgba(14, 20, 36, 0.78);
+  border: 1px solid var(--vdm-border-strong);
+  backdrop-filter: blur(24px);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), var(--vdm-glow);
+  animation: vdm-rise 0.5s ease both;
 }
 
 .auth-logo {
   text-align: center;
-  margin-bottom: 24px;
+  margin-bottom: 26px;
 }
-
+.auth-mark {
+  width: 58px;
+  height: 58px;
+  margin: 0 auto 14px;
+  border-radius: 18px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, #3d7dff, #22d3ee);
+  box-shadow: 0 0 40px rgba(61, 125, 255, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
 .auth-logo h1 {
-  font-size: 20px;
-  margin: 10px 0 4px;
-  color: #1f2d3d;
+  margin: 0 0 6px;
+  font-family: var(--vdm-font-display);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 10px;
+  text-indent: 10px;
+  background: linear-gradient(100deg, #ffffff, #a9c6ff 50%, #22d3ee);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
-
 .auth-logo p {
-  font-size: 13px;
-  color: #909399;
   margin: 0;
+  font-size: 12.5px;
+  color: var(--vdm-text-mute);
 }
 
 .submit-btn {
   width: 100%;
+  height: 46px;
+  font-size: 15px;
+  letter-spacing: 4px;
+  border: none;
+  background: linear-gradient(135deg, #3d7dff, #22d3ee);
+  box-shadow: 0 12px 30px rgba(61, 125, 255, 0.45);
+}
+.submit-btn:hover {
+  box-shadow: 0 16px 40px rgba(61, 125, 255, 0.6);
 }
 
 .auth-footer {
   text-align: center;
   font-size: 13px;
-  color: #909399;
+  color: var(--vdm-text-mute);
 }
-
 .auth-footer a {
-  color: #409eff;
+  color: #8fb6ff;
   text-decoration: none;
+}
+.auth-footer a:hover {
+  color: #fff;
 }
 </style>

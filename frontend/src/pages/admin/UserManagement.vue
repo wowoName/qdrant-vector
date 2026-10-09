@@ -369,9 +369,11 @@ onMounted(loadData)
 
 <style scoped>
 .page-container {
-  background: #fff;
-  border-radius: 8px;
   padding: 16px;
+  border-radius: var(--vdm-radius);
+  background: rgba(17, 23, 40, 0.5);
+  border: 1px solid var(--vdm-border);
+  backdrop-filter: blur(12px);
 }
 
 .toolbar {

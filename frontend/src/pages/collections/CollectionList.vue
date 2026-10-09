@@ -1,13 +1,6 @@
 <template>
   <div class="collections-page">
-    <div class="page-header flex-between mb-4">
-      <h2 class="text-xl font-bold m-0">知识库管理</h2>
-      <el-button v-if="canWriteUser" type="primary" :icon="Plus" @click="showCreateDialog = true">
-        新建知识库
-      </el-button>
-    </div>
-
-    <div class="search-bar mb-4">
+    <div class="page-toolbar mb-4">
       <el-input
         v-model="keyword"
         placeholder="搜索知识库名称"
@@ -17,6 +10,9 @@
         @clear="fetchData"
         class="w-80"
       />
+      <el-button v-if="canWriteUser" type="primary" :icon="Plus" @click="showCreateDialog = true">
+        新建知识库
+      </el-button>
     </div>
 
     <el-card shadow="hover" class="collection-card">
@@ -237,6 +233,13 @@ onMounted(() => {
 <style scoped>
 .collections-page {
   height: 100%;
+}
+
+.page-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .collection-card {

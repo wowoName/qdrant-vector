@@ -1,9 +1,5 @@
 <template>
   <div class="search-page">
-    <div class="page-header mb-4">
-      <h2 class="text-xl font-bold m-0">向量检索</h2>
-    </div>
-
     <el-card class="mb-4">
       <el-form :inline="true" :model="form">
         <el-form-item label="知识库">
@@ -65,7 +61,7 @@
             </span>
           </div>
         </div>
-        <div class="result-text p-3 bg-gray-50 rounded text-sm leading-relaxed">
+        <div class="result-text p-3 rounded text-sm leading-relaxed">
           {{ item.text }}
         </div>
         <el-divider v-if="index < results.length - 1" />
@@ -178,7 +174,7 @@ onMounted(() => {
 
 .threshold-value {
   font-size: 13px;
-  color: #606266;
+  color: var(--vdm-text-dim);
   min-width: 40px;
   text-align: right;
 }
@@ -188,5 +184,8 @@ onMounted(() => {
   word-break: break-word;
   max-height: 200px;
   overflow-y: auto;
+  color: var(--vdm-text-dim);
+  background: rgba(122, 162, 255, 0.05);
+  border: 1px solid var(--vdm-border);
 }
 </style>
