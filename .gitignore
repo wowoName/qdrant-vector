@@ -1,0 +1,144 @@
+# ==============================================
+# Python (Backend)
+# ==============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+.uv-cache/
+
+# ==============================================
+# Node.js (Frontend)
+# ==============================================
+node_modules/
+.npm/
+.pnp/
+.pnp.js
+.yarn/
+.yarn-integrity
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Frontend build output
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# ==============================================
+# IDE / Editor
+# ==============================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ==============================================
+# OS
+# ==============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ==============================================
+# Environment & Secrets
+# ==============================================
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ==============================================
+# Runtime Data & Logs
+# ==============================================
+backend/data/
+backend/data/logs/
+backend/data/storage/
+backend/data/models/
+backend/data/*.db
+backend/data/*.db-*
+backend/*.db
+backend/*.db-*
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+
+# ==============================================
+# Qdrant
+# ==============================================
+qdrant_data/
+qdrant_snapshots/
+*.qdrant
+
+# ==============================================
+# Test & Coverage
+# ==============================================
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ==============================================
+# Misc
+# ==============================================
+*.tmp
+*.bak
+*.swp
+*~.npy
+*~.npz

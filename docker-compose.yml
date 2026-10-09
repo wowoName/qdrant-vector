@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.10.1
+    container_name: vdm-qdrant
+    restart: unless-stopped
+    ports:
+      - '6333:6333'
+      - '6334:6334'
+    volumes:
+      - qdrant-data:/qdrant/storage # ← 改成命名卷
+    environment:
+      - QDRANT__LOG_LEVEL=INFO
+
+  redis:
+    image: redis:7-alpine
+    container_name: vdm-redis
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data # ← 改成命名卷
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: vdm-postgres
+    restart: unless-stopped
+    ports:
+      - '5432:5432'
+    environment:
+      - POSTGRES_USER=vdm_user
+      - POSTGRES_PASSWORD=vdm_password
+      - POSTGRES_DB=vdm_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c work_mem=4MB
+      -c maintenance_work_mem=64MB
+
+volumes:
+  qdrant-data:
+    name: vdm-qdrant-data
+  redis-data:
+    name: vdm-redis-data
+  postgres-data:
+    name: vdm-postgres-data

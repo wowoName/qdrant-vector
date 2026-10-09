@@ -1,0 +1,28 @@
+"""
+Directory ORM 模型
+"""
+
+import uuid
+from datetime import datetime
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Index
+
+from app.core.database import Base
+
+
+class DirectoryDB(Base):
+    """目录树节点"""
+
+    __tablename__ = "directories"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id = Column(String(36), nullable=False, index=True)
+    parent_id = Column(String(36), nullable=True, index=True)  # 根目录为 NULL
+    name = Column(String(100), nullable=False)
+    path = Column(String(500), default="")  # 冗余路径，便于查询
+    sort_order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_collection_parent", "collection_id", "parent_id"),
+    )
