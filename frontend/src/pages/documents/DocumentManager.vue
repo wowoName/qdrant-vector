@@ -7,7 +7,7 @@
     @drop.prevent="handleDrop"
   >
     <!-- 拖拽覆盖层 -->
-    <div v-if="isDragging" class="drag-overlay">
+    <div v-if="isDragging && canWriteUser" class="drag-overlay">
       <div class="drag-overlay-content">
         <el-icon :size="64" color="#409eff"><Upload /></el-icon>
         <p class="drag-text">松开鼠标上传文件到当前目录</p>
@@ -24,7 +24,7 @@
         <el-tag v-if="collectionId" type="info" size="small">{{ collectionId }}</el-tag>
       </div>
       <div class="flex items-center gap-3">
-        <el-button type="primary" :icon="Upload" :loading="uploading" @click="triggerUpload">
+        <el-button v-if="canWriteUser" type="primary" :icon="Upload" :loading="uploading" @click="triggerUpload">
           上传文档
         </el-button>
         <input
@@ -51,7 +51,7 @@
           <template #header>
             <div class="flex-between">
               <span class="font-medium">目录</span>
-              <el-button :icon="Plus" text size="small" @click="handleAddDir">新建</el-button>
+              <el-button v-if="canWriteUser" :icon="Plus" text size="small" @click="handleAddDir">新建</el-button>
             </div>
           </template>
           <el-tree
@@ -139,7 +139,7 @@
             <el-table-column label="操作" width="150" fixed="right" align="center">
               <template #default="{ row }">
                 <el-button type="primary" link size="small" @click="handleView(row)">查看</el-button>
-                <el-button type="danger" link size="small" @click="handleDelete(row)">删除</el-button>
+                <el-button v-if="canWriteUser" type="danger" link size="small" @click="handleDelete(row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -185,11 +185,14 @@ import {
 } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import request from '@/utils/request'
+import { canWrite } from '@/utils/user'
 import FilePreviewDrawer from '@/components/FilePreviewDrawer.vue'
 import UploadProgressDialog from '@/components/UploadProgressDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
+
+const canWriteUser = computed(() => canWrite())
 
 const collectionId = computed(() => route.params.id as string)
 const collectionName = ref('知识库')
@@ -289,6 +292,11 @@ function handleTreeNodeDrop(e: DragEvent, data: any) {
 }
 
 function processDroppedFiles(files: File[], directoryId: string) {
+  // 自用号只读：不允许上传（含拖拽）
+  if (!canWriteUser.value) {
+    ElMessage.warning('自用号仅可查看和使用，不能上传文档')
+    return
+  }
   // 校验文件类型
   const validFiles = files.filter(file => {
     const ext = file.name.split('.').pop()?.toLowerCase()

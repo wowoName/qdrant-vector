@@ -5,9 +5,11 @@ OpenAI 兼容 LLM 基础实现
 按需覆写 _build_url / _build_headers / _build_body / _parse_choice 等方法。
 """
 
-import httpx
-from typing import List, Optional, AsyncGenerator, Any, Dict
 import json
+from collections.abc import AsyncGenerator
+from typing import Any
+
+import httpx
 
 from .base import BaseLLM, ChatMessage, ChatResponse
 
@@ -19,7 +21,7 @@ class OpenAICompatibleLLM(BaseLLM):
         self,
         provider: str,
         model: str,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         base_url: str = "https://api.openai.com/v1",
         temperature: float = 0.7,
         max_tokens: int = 2048,
@@ -27,8 +29,8 @@ class OpenAICompatibleLLM(BaseLLM):
         api_path: str = "/chat/completions",
         auth_header: str = "Authorization",
         auth_prefix: str = "Bearer ",
-        extra_headers: Optional[dict] = None,
-        extra_body: Optional[dict] = None,
+        extra_headers: dict | None = None,
+        extra_body: dict | None = None,
     ):
         self._provider = provider
         self._model = model.strip() if model else model
@@ -70,9 +72,9 @@ class OpenAICompatibleLLM(BaseLLM):
 
     def _build_body(
         self,
-        messages: List[ChatMessage],
-        temperature: Optional[float],
-        max_tokens: Optional[int],
+        messages: list[ChatMessage],
+        temperature: float | None,
+        max_tokens: int | None,
         stream: bool = False,
         **kwargs: Any,
     ) -> dict:
@@ -160,9 +162,9 @@ class OpenAICompatibleLLM(BaseLLM):
 
     async def chat(
         self,
-        messages: List[ChatMessage],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> ChatResponse:
         url = self._build_url(stream=False)
@@ -173,9 +175,7 @@ class OpenAICompatibleLLM(BaseLLM):
             resp = await client.post(url, json=body, headers=headers)
             if resp.status_code >= 400:
                 err_msg = self._extract_error_message(resp)
-                raise RuntimeError(
-                    f"LLM API 调用失败 (HTTP {resp.status_code}): {err_msg}"
-                )
+                raise RuntimeError(f"LLM API 调用失败 (HTTP {resp.status_code}): {err_msg}")
             data = resp.json()
 
         choices = data.get("choices", [])
@@ -190,11 +190,11 @@ class OpenAICompatibleLLM(BaseLLM):
 
     async def chat_stream(
         self,
-        messages: List[ChatMessage],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
-    ) -> AsyncGenerator[Dict[str, str], None]:
+    ) -> AsyncGenerator[dict[str, str], None]:
         url = self._build_url(stream=True)
         body = self._build_body(messages, temperature, max_tokens, stream=True, **kwargs)
         headers = self._build_headers()
@@ -203,9 +203,7 @@ class OpenAICompatibleLLM(BaseLLM):
             async with client.stream("POST", url, json=body, headers=headers) as resp:
                 if resp.status_code >= 400:
                     err_msg = await self._extract_error_message_async(resp)
-                    raise RuntimeError(
-                        f"LLM API 调用失败 (HTTP {resp.status_code}): {err_msg}"
-                    )
+                    raise RuntimeError(f"LLM API 调用失败 (HTTP {resp.status_code}): {err_msg}")
                 async for line in resp.aiter_lines():
                     if not line:
                         continue

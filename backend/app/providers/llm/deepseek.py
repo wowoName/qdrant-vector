@@ -4,8 +4,6 @@ DeepSeek LLM 实现
 完全兼容 OpenAI 接口规范。
 """
 
-from typing import Optional
-
 from .openai_compatible import OpenAICompatibleLLM
 
 
@@ -15,7 +13,7 @@ class DeepSeekLLM(OpenAICompatibleLLM):
     def __init__(
         self,
         model: str = "deepseek-chat",
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         base_url: str = "https://api.deepseek.com/v1",
         temperature: float = 0.7,
         max_tokens: int = 2048,

@@ -4,8 +4,8 @@ Collection ORM 模型
 
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text
-from sqlalchemy.dialects.postgresql import UUID
+
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
 
 from app.core.database import Base
 
@@ -18,6 +18,8 @@ class CollectionDB(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String(100), nullable=False, unique=True, index=True)
     description = Column(Text, default="")
+    # 归属用户 ID（SaaS 隔离：用户只能访问自己的知识库）
+    owner_user_id = Column(String(36), nullable=True, index=True)
     embedding_model = Column(String(100), nullable=False, default="BAAI/bge-m3")
     vector_dim = Column(Integer, nullable=False, default=1024)
     distance_metric = Column(String(20), nullable=False, default="cosine")

@@ -158,11 +158,187 @@ async def migration_v1_collection_id_nullable(engine, db_url: str) -> bool:
     return True
 
 
+# ---------- 迁移 v2：collections 增加 owner_user_id（SaaS 归属） ----------
+
+async def migration_v2_collection_owner(engine, db_url: str) -> bool:
+    """迁移 v2: collections 表增加 owner_user_id 列（旧数据 owner 为 NULL）"""
+    table_exists = await _table_exists_async(engine, "collections")
+    if not table_exists:
+        return False
+
+    from sqlalchemy import inspect
+
+    def _has_col(sync_conn):
+        insp = inspect(sync_conn)
+        cols = [c["name"] for c in insp.get_columns("collections")]
+        return "owner_user_id" in cols
+
+    async with engine.begin() as conn:
+        has = await conn.run_sync(_has_col)
+    if has:
+        return False
+
+    print("[migration v2] Adding collections.owner_user_id...")
+
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "ALTER TABLE collections ADD COLUMN owner_user_id VARCHAR(36)"
+        )
+        try:
+            await conn.exec_driver_sql(
+                "CREATE INDEX ix_collections_owner_user_id ON collections (owner_user_id)"
+            )
+        except Exception:
+            # 索引已存在或创建失败不影响主流程
+            pass
+
+    print("[migration v2] Done.")
+    return True
+
+
+# ---------- 迁移 v3：email_codes 增加 failed_attempts 列 ----------
+
+async def migration_v3_email_code_attempts(engine, db_url: str) -> bool:
+    """迁移 v3: email_codes 表增加 failed_attempts 列（防暴力破解）"""
+    table_exists = await _table_exists_async(engine, "email_codes")
+    if not table_exists:
+        return False
+
+    from sqlalchemy import inspect
+
+    def _has_col(sync_conn):
+        insp = inspect(sync_conn)
+        cols = [c["name"] for c in insp.get_columns("email_codes")]
+        return "failed_attempts" in cols
+
+    async with engine.begin() as conn:
+        has = await conn.run_sync(_has_col)
+    if has:
+        return False
+
+    print("[migration v3] Adding email_codes.failed_attempts...")
+
+    async with engine.begin() as conn:
+        if _is_sqlite(db_url):
+            await conn.exec_driver_sql(
+                "ALTER TABLE email_codes ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        else:
+            await conn.exec_driver_sql(
+                "ALTER TABLE email_codes ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+
+    print("[migration v3] Done.")
+    return True
+
+
+# ---------- 迁移 v4：用户角色 admin→super_admin（三级层级改造） ----------
+
+async def migration_v4_user_roles_hierarchy(engine, db_url: str) -> bool:
+    """迁移 v4: 将 role='admin' 更新为 'super_admin'（三级层级改造）
+
+    旧模型只有 admin/user 两种角色，新模型改为 super_admin/tenant_admin/user。
+    - 旧 admin → super_admin（首个管理员成为总管理员）
+    - 旧 user（owner_admin_id 指向旧 admin）→ 保持 user（作为子用户）
+    """
+    table_exists = await _table_exists_async(engine, "users")
+    if not table_exists:
+        return False
+
+    print("[migration v4] Updating user roles to three-tier hierarchy...")
+
+    async with engine.begin() as conn:
+        # 将 role='admin' 的用户更新为 super_admin
+        await conn.exec_driver_sql(
+            "UPDATE users SET role = 'super_admin' WHERE role = 'admin'"
+        )
+
+    print("[migration v4] Done.")
+    return True
+
+
+# ---------- 迁移 v5：tasks 增加 user_id 列（SaaS 隔离） ----------
+
+async def migration_v5_task_user_id(engine, db_url: str) -> bool:
+    """迁移 v5: tasks 表增加 user_id 列并回填历史任务归属（SaaS 隔离）
+
+    - 新增 user_id 列（若不存在）
+    - 回填历史任务 user_id：依据 payload.collection_id 关联 collections.owner_user_id
+      （幂等，仅处理 user_id 仍为 NULL 的行；无法确定归属的保持 NULL）
+    """
+    table_exists = await _table_exists_async(engine, "tasks")
+    if not table_exists:
+        return False
+
+    from sqlalchemy import inspect
+
+    def _has_col(sync_conn):
+        insp = inspect(sync_conn)
+        cols = [c["name"] for c in insp.get_columns("tasks")]
+        return "user_id" in cols
+
+    async with engine.begin() as conn:
+        has = await conn.run_sync(_has_col)
+
+    added = False
+    if not has:
+        print("[migration v5] Adding tasks.user_id...")
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql(
+                "ALTER TABLE tasks ADD COLUMN user_id VARCHAR(36)"
+            )
+            try:
+                await conn.exec_driver_sql(
+                    "CREATE INDEX ix_tasks_user_id ON tasks (user_id)"
+                )
+            except Exception:
+                pass
+        added = True
+
+    # 回填历史任务的 user_id（幂等：只处理仍为 NULL 的行）
+    if _is_postgresql(db_url):
+        backfill_sql = """
+            UPDATE tasks t
+            SET user_id = c.owner_user_id
+            FROM collections c
+            WHERE t.user_id IS NULL
+              AND t.payload ->> 'collection_id' = c.id
+              AND c.owner_user_id IS NOT NULL
+        """
+    elif _is_sqlite(db_url):
+        backfill_sql = """
+            UPDATE tasks
+            SET user_id = (
+                SELECT c.owner_user_id FROM collections c
+                WHERE c.id = json_extract(tasks.payload, '$.collection_id')
+            )
+            WHERE user_id IS NULL
+              AND json_extract(payload, '$.collection_id') IS NOT NULL
+        """
+    else:
+        backfill_sql = None
+
+    if backfill_sql:
+        try:
+            async with engine.begin() as conn:
+                result = await conn.exec_driver_sql(backfill_sql)
+            print(f"[migration v5] Backfilled task user_id: {getattr(result, 'rowcount', '?')} rows.")
+        except Exception as e:
+            print(f"[migration v5] Backfill skipped: {e}")
+
+    print("[migration v5] Done.")
+    return added
+
+
 # ---------- 迁移注册表 ----------
 # 每个迁移签名: (name, async_fn(engine, db_url) -> bool)
 
 MIGRATIONS: list[tuple[str, Callable]] = [
     ("v1_collection_id_nullable", migration_v1_collection_id_nullable),
+    ("v2_collection_owner_user_id", migration_v2_collection_owner),
+    ("v3_email_code_failed_attempts", migration_v3_email_code_attempts),
+    ("v4_user_roles_hierarchy", migration_v4_user_roles_hierarchy),
+    ("v5_task_user_id", migration_v5_task_user_id),
 ]
 
 
@@ -195,12 +371,14 @@ async def run_migrations_async(engine, db_url: str) -> list[str]:
 
 def run_migrations(db_path: str | None = None) -> list[str]:
     """
-    同步运行迁移（SQLite 本地文件用，向后兼容）
+    同步运行迁移（SQLite 本地文件用，命令行手动迁移）
 
-    此函数仅用于 SQLite 本地文件的命令行手动迁移。
-    应用启动时使用 run_migrations_async。
+    为避免与启动时的异步迁移逻辑不一致，此入口直接复用 run_migrations_async，
+    对指定 SQLite 文件执行全部迁移（v1–v5），不再单独维护一份同步实现。
     """
-    import sqlite3
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
 
     if db_path is None:
         db_path = "data/vdm.db"
@@ -208,64 +386,16 @@ def run_migrations(db_path: str | None = None) -> list[str]:
     if not os.path.exists(db_path):
         return []
 
-    applied: list[str] = []
+    db_url = f"sqlite+aiosqlite:///{db_path}"
 
-    conn = sqlite3.connect(db_path)
-    try:
-        # SQLite 版本的迁移（直接用同步连接跑）
-        for name, _ in MIGRATIONS:
-            if name == "v1_collection_id_nullable":
-                cursor = conn.cursor()
-                cursor.execute("PRAGMA table_info(conversations);")
-                cols = {row[1]: row for row in cursor.fetchall()}
-                if "collection_id" not in cols:
-                    continue
-                notnull = cols["collection_id"][3]
-                if notnull == 0:
-                    continue
+    async def _run() -> list[str]:
+        engine = create_async_engine(db_url)
+        try:
+            return await run_migrations_async(engine, db_url)
+        finally:
+            await engine.dispose()
 
-                print("[migration v1] Migrating conversations.collection_id to nullable...")
-
-                cursor.execute("""
-                    CREATE TABLE conversations_new (
-                        id VARCHAR(36) PRIMARY KEY,
-                        session_id VARCHAR(64) NOT NULL UNIQUE,
-                        collection_id VARCHAR(36),
-                        user_id VARCHAR(64),
-                        title VARCHAR(255),
-                        message_count INTEGER DEFAULT 0,
-                        total_tokens INTEGER DEFAULT 0,
-                        version INTEGER NOT NULL DEFAULT 0,
-                        status VARCHAR(20) DEFAULT 'active',
-                        created_at DATETIME,
-                        updated_at DATETIME
-                    )
-                """)
-                cursor.execute("""
-                    INSERT INTO conversations_new
-                        (id, session_id, collection_id, user_id, title, message_count,
-                         total_tokens, version, status, created_at, updated_at)
-                    SELECT id, session_id, collection_id, user_id, title, message_count,
-                           total_tokens, version, status, created_at, updated_at
-                    FROM conversations
-                """)
-                cursor.execute("DROP TABLE conversations")
-                cursor.execute("ALTER TABLE conversations_new RENAME TO conversations")
-                cursor.execute("CREATE INDEX idx_conversations_session_id ON conversations(session_id)")
-                cursor.execute("CREATE INDEX idx_conversations_collection_id ON conversations(collection_id)")
-                cursor.execute("CREATE INDEX idx_conversations_user_id ON conversations(user_id)")
-                cursor.execute("CREATE INDEX idx_conversations_created_at ON conversations(created_at)")
-                cursor.execute("CREATE INDEX idx_conversations_updated_at ON conversations(updated_at)")
-                cursor.execute("CREATE INDEX idx_collection_user ON conversations(collection_id, user_id)")
-                conn.commit()
-
-                row_count = cursor.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-                print(f"[migration v1] Done. {row_count} rows migrated.")
-                applied.append(name)
-    finally:
-        conn.close()
-
-    return applied
+    return asyncio.run(_run())
 
 
 if __name__ == "__main__":

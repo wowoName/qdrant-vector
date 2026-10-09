@@ -4,10 +4,12 @@ API v1 路由
 
 from fastapi import APIRouter
 
-from . import collection, directory, document, upload, search, chat, task, system
+from . import collection, directory, document, upload, search, chat, task, system, auth, admin
 
 api_router = APIRouter(prefix="/api/v1")
 
+api_router.include_router(auth.router, prefix="", tags=["Auth"])
+api_router.include_router(admin.router, prefix="", tags=["Admin"])
 api_router.include_router(collection.router, prefix="/collections", tags=["Collections"])
 api_router.include_router(directory.router, prefix="", tags=["Directories"])
 api_router.include_router(document.router, prefix="", tags=["Documents"])

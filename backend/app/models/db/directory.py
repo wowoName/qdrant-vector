@@ -4,7 +4,8 @@ Directory ORM 模型
 
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Index
+
+from sqlalchemy import Column, DateTime, Index, Integer, String
 
 from app.core.database import Base
 
@@ -23,6 +24,4 @@ class DirectoryDB(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    __table_args__ = (
-        Index("idx_collection_parent", "collection_id", "parent_id"),
-    )
+    __table_args__ = (Index("idx_collection_parent", "collection_id", "parent_id"),)

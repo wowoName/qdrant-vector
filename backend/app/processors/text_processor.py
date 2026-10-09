@@ -7,14 +7,14 @@
 不需要全局统一一套参数。
 """
 
-import asyncio
-from typing import List, Iterator
+from collections.abc import Iterator
+
+from app.chunkers.base import BaseChunker, ChunkItem
+from app.core.config import get_chunk_config, settings
+from app.core.logging import get_logger
+from app.parsers.base import BaseParser, ParseResult
 
 from .base import BaseDocumentProcessor, ProcessInfo
-from app.parsers.base import BaseParser, ParseResult
-from app.chunkers.base import BaseChunker, ChunkItem
-from app.core.logging import get_logger
-from app.core.config import settings, get_chunk_config
 
 logger = get_logger(__name__)
 
@@ -97,14 +97,14 @@ class TextDocumentProcessor(BaseDocumentProcessor):
     # ------------------------------------------------------------------
     # 基类接口实现
     # ------------------------------------------------------------------
-    def supported_types(self) -> List[str]:
+    def supported_types(self) -> list[str]:
         return self._get_parser().supported_types()
 
     async def parse(self, file_path: str) -> ParseResult:
         """全量解析"""
         return await self._get_parser().parse(file_path)
 
-    async def chunk(self, file_path: str) -> List[ChunkItem]:
+    async def chunk(self, file_path: str) -> list[ChunkItem]:
         """全量切片"""
         chunker = self._get_chunker()
         parse_result = await self.parse(file_path)

@@ -9,9 +9,16 @@ Chat ORM 模型 - 会话 / 消息 / 摘要
 
 import uuid
 from datetime import datetime
+
 from sqlalchemy import (
-    Column, String, Integer, BigInteger, Text, DateTime,
-    ForeignKey, Index, Boolean, Float,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
 )
 
 from app.core.chat_database import ChatBase
@@ -46,9 +53,7 @@ class ConversationDB(ChatBase):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
 
-    __table_args__ = (
-        Index("idx_collection_user", "collection_id", "user_id"),
-    )
+    __table_args__ = (Index("idx_collection_user", "collection_id", "user_id"),)
 
 
 class MessageDB(ChatBase):
@@ -110,6 +115,4 @@ class ConversationSummaryDB(ChatBase):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    __table_args__ = (
-        Index("idx_conv_level", "conversation_id", "level", unique=True),
-    )
+    __table_args__ = (Index("idx_conv_level", "conversation_id", "level", unique=True),)

@@ -12,18 +12,25 @@
 
 import asyncio
 import os
-import tempfile
-from typing import List
 
-from .base import BaseParser, ParseResult
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.utils.text_cleaner import normalize_text, clean_whitespace
+from app.utils.text_cleaner import clean_whitespace, normalize_text
+
+from .base import BaseParser, ParseResult
 
 logger = get_logger(__name__)
 
 AUDIO_EXTENSIONS = {
-    "mp3", "wav", "m4a", "flac", "aac", "ogg", "wma", "opus", "amr",
+    "mp3",
+    "wav",
+    "m4a",
+    "flac",
+    "aac",
+    "ogg",
+    "wma",
+    "opus",
+    "amr",
 }
 
 # ASR 引擎缓存
@@ -45,9 +52,11 @@ def _get_asr_engine():
     # 1. 尝试 faster-whisper（推荐，更快更省内存）
     try:
         from faster_whisper import WhisperModel
+
         device = getattr(settings, "asr_device", "auto")
         if device == "auto":
             import torch
+
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
         compute_type = "int8" if device == "cpu" else "float16"
@@ -63,6 +72,7 @@ def _get_asr_engine():
     # 2. 尝试 openai-whisper（官方实现）
     try:
         import whisper
+
         _asr_engine = whisper.load_model(model_name)
         _asr_backend = "whisper"
         logger.info(f"ASR backend: openai-whisper ({model_name})")
@@ -83,7 +93,7 @@ def _get_asr_engine():
 class AudioParser(BaseParser):
     """音频解析器（语音转文字）"""
 
-    def supported_types(self) -> List[str]:
+    def supported_types(self) -> list[str]:
         return ["audio"]
 
     async def parse(self, file_path: str) -> ParseResult:
@@ -121,9 +131,7 @@ class AudioParser(BaseParser):
 
         return ParseResult(text="", pages=[], metadata={"file_name": filename})
 
-    def _transcribe_faster_whisper(
-        self, file_path: str, model, filename: str
-    ) -> ParseResult:
+    def _transcribe_faster_whisper(self, file_path: str, model, filename: str) -> ParseResult:
         """使用 faster-whisper 转写"""
         language = getattr(settings, "asr_language", None)  # None=自动检测
 
@@ -134,7 +142,7 @@ class AudioParser(BaseParser):
             vad_filter=True,  # 启用 VAD，跳过静音段
         )
 
-        pages = []      # 按时间段分"页"
+        pages = []  # 按时间段分"页"
         all_texts = []
         current_segment_texts = []
         current_duration = 0.0
@@ -191,9 +199,7 @@ class AudioParser(BaseParser):
             },
         )
 
-    def _transcribe_whisper(
-        self, file_path: str, model, filename: str
-    ) -> ParseResult:
+    def _transcribe_whisper(self, file_path: str, model, filename: str) -> ParseResult:
         """使用 openai-whisper 转写"""
         language = getattr(settings, "asr_language", None)
 

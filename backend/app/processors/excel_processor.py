@@ -20,7 +20,7 @@ Excel 文档处理器
 
 import os
 import time
-from typing import AsyncGenerator, Iterator, List
+from collections.abc import AsyncGenerator, Iterator
 
 from app.chunkers.base import ChunkItem, RecordItem
 from app.chunkers.tabular_chunker import TabularChunker
@@ -28,7 +28,6 @@ from app.core.config import get_tabular_config, settings
 from app.core.logging import get_logger
 from app.parsers.base import ParseResult
 from app.parsers.excel_parser import ExcelParser
-from app.utils.text_cleaner import normalize_text
 
 from .base import BaseDocumentProcessor, ProcessInfo
 
@@ -85,8 +84,7 @@ class ExcelProcessor(BaseDocumentProcessor):
             chunks = [self._record_to_chunk(r, i) for i, r in enumerate(records)]
             elapsed = time.perf_counter() - t0
             logger.info(
-                f"[ExcelChunker] {file_path}: {elapsed:.2f}s, "
-                f"mode=record, chunks={len(chunks)}"
+                f"[ExcelChunker] {file_path}: {elapsed:.2f}s, mode=record, chunks={len(chunks)}"
             )
             return chunks
 
@@ -199,7 +197,7 @@ class ExcelProcessor(BaseDocumentProcessor):
         file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
         logger.info(
             f"[Excel-Perf] Record stream start: {file_path}, "
-            f"ext={ext}, size={file_size/1024/1024:.2f}MB"
+            f"ext={ext}, size={file_size / 1024 / 1024:.2f}MB"
         )
         record_count = 0
 
@@ -213,6 +211,7 @@ class ExcelProcessor(BaseDocumentProcessor):
         else:
             # 其他类型暂时走全量（xls 需要 xlrd，不支持流式）
             import functools
+
             records = await asyncio.to_thread(
                 functools.partial(self._records_sync_fallback, file_path, document_id)
             )
@@ -237,9 +236,9 @@ class ExcelProcessor(BaseDocumentProcessor):
         """
         import asyncio
         import threading
-        from queue import Queue, Empty
+        from queue import Empty, Queue
 
-        q: "Queue" = Queue(maxsize=200)
+        q: Queue = Queue(maxsize=200)
         sentinel = object()
         error_holder: list = []
 
@@ -294,9 +293,7 @@ class ExcelProcessor(BaseDocumentProcessor):
         if error_holder:
             raise error_holder[0]
 
-    def _record_stream_xlsx_sync(
-        self, file_path: str, document_id: str
-    ) -> Iterator[RecordItem]:
+    def _record_stream_xlsx_sync(self, file_path: str, document_id: str) -> Iterator[RecordItem]:
         """
         xlsx 流式读取（同步生成器，基于 openpyxl read_only + iter_rows）
 
@@ -307,8 +304,8 @@ class ExcelProcessor(BaseDocumentProcessor):
 
         在独立线程中被调用，通过 _sync_gen_to_async 桥接为异步。
         """
+
         from openpyxl import load_workbook
-        from typing import Iterator
 
         t_open_start = time.perf_counter()
         wb = load_workbook(file_path, read_only=True, data_only=True)
@@ -393,15 +390,13 @@ class ExcelProcessor(BaseDocumentProcessor):
                 logger.debug(
                     f"[Excel-Perf] Sheet '{sheet_name}' done: {row_num} records, "
                     f"time={t_sheet:.3f}s, skipped_empty={empty_rows_skipped}, "
-                    f"speed={row_num/t_sheet if t_sheet > 0 else 0:.1f} records/s"
+                    f"speed={row_num / t_sheet if t_sheet > 0 else 0:.1f} records/s"
                 )
 
         finally:
             wb.close()
 
-        logger.debug(
-            f"[Excel-Perf] All sheets done: total_records={total_records}"
-        )
+        logger.debug(f"[Excel-Perf] All sheets done: total_records={total_records}")
 
     def _records_sync_fallback(self, file_path: str, document_id: str) -> list[RecordItem]:
         """
@@ -418,7 +413,9 @@ class ExcelProcessor(BaseDocumentProcessor):
             if not table or len(table) < 2:
                 continue
             headers = table[0]
-            sheet_name = sheet_names[sheet_idx] if sheet_idx < len(sheet_names) else f"Sheet{sheet_idx + 1}"
+            sheet_name = (
+                sheet_names[sheet_idx] if sheet_idx < len(sheet_names) else f"Sheet{sheet_idx + 1}"
+            )
 
             for row_num, row in enumerate(table[1:]):
                 data = {}
@@ -429,17 +426,19 @@ class ExcelProcessor(BaseDocumentProcessor):
                         text_parts.append(f"{headers[i]}：{val}")
 
                 record_id = self._make_record_id(document_id, sheet_idx, row_num, sheet_name)
-                records.append(RecordItem(
-                    record_id=record_id,
-                    sheet_name=sheet_name,
-                    row_number=row_num,
-                    data=data,
-                    text="；".join(text_parts),
-                    metadata={
-                        "sheet_index": sheet_idx,
-                        "document_id": document_id,
-                    },
-                ))
+                records.append(
+                    RecordItem(
+                        record_id=record_id,
+                        sheet_name=sheet_name,
+                        row_number=row_num,
+                        data=data,
+                        text="；".join(text_parts),
+                        metadata={
+                            "sheet_index": sheet_idx,
+                            "document_id": document_id,
+                        },
+                    )
+                )
 
         return records
 
@@ -606,7 +605,9 @@ class ExcelProcessor(BaseDocumentProcessor):
         ext = os.path.splitext(file_path)[1].lower().lstrip(".")
         return ext if ext else "xlsx"
 
-    def _make_record_id(self, document_id: str, sheet_idx: int, row_num: int, sheet_name: str = "") -> str:
+    def _make_record_id(
+        self, document_id: str, sheet_idx: int, row_num: int, sheet_name: str = ""
+    ) -> str:
         """生成记录唯一 ID"""
         doc_part = document_id or "unknown"
         return f"{doc_part}:{sheet_idx}:{row_num}"

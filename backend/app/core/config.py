@@ -309,6 +309,23 @@ class Settings(BaseSettings):
     task_max_retries: int = 3
     task_retry_delay: int = 30
 
+    # ---------- 认证 / SaaS 配置 ----------
+    # JWT 配置
+    jwt_algorithm: str = "HS256"
+    jwt_expire_days: int = 7
+    # 邮箱验证码有效期（分钟）
+    email_code_expire_minutes: int = 10
+    # 邮件验证码发送间隔（秒，防刷）
+    email_code_resend_seconds: int = 60
+    # SMTP 邮件配置（不配置时：开发模式下验证码写入日志并随接口返回，方便测试）
+    smtp_host: str | None = None
+    smtp_port: int = 465
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_from: str | None = None  # 发件人，默认使用 smtp_user
+    smtp_use_ssl: bool = True
+    smtp_use_tls: bool = False
+
     # ---------- 日志配置 ----------
     log_level: str = "INFO"
     log_file: str = "./data/logs/vdm.log"

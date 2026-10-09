@@ -2,8 +2,6 @@
 Markdown 文档处理器
 """
 
-from typing import List
-
 from .text_processor import TextDocumentProcessor
 
 
@@ -12,7 +10,8 @@ class MarkdownProcessor(TextDocumentProcessor):
 
     def _create_parser(self):
         from app.parsers.markdown_parser import MarkdownParser
+
         return MarkdownParser()
 
-    def supported_types(self) -> List[str]:
+    def supported_types(self) -> list[str]:
         return ["markdown", "md"]

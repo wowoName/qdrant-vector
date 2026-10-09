@@ -8,11 +8,12 @@
 - 错误码格式：{error: {code: "InvalidEndpointOrModel.NotFound", message: "..."}}
 """
 
-from typing import Optional, List, Any, AsyncGenerator
 import logging
+from collections.abc import AsyncGenerator
+from typing import Any
 
-from .openai_compatible import OpenAICompatibleLLM
 from .base import ChatMessage, ChatResponse
+from .openai_compatible import OpenAICompatibleLLM
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +55,9 @@ class ArkLLM(OpenAICompatibleLLM):
 
     def _build_body(
         self,
-        messages: List[ChatMessage],
-        temperature: Optional[float],
-        max_tokens: Optional[int],
+        messages: list[ChatMessage],
+        temperature: float | None,
+        max_tokens: int | None,
         stream: bool = False,
         **kwargs: Any,
     ) -> dict:
@@ -86,9 +87,9 @@ class ArkLLM(OpenAICompatibleLLM):
 
     async def chat(
         self,
-        messages: List[ChatMessage],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> ChatResponse:
         try:
@@ -106,9 +107,9 @@ class ArkLLM(OpenAICompatibleLLM):
 
     async def chat_stream(
         self,
-        messages: List[ChatMessage],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[Any, None]:
         try:

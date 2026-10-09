@@ -9,14 +9,13 @@ Qdrant 启动同步服务
   - disabled:   不自动同步
 """
 
-from typing import Optional
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.db.collection import CollectionDB
-from app.models.db.document import DocumentDB, DocumentVersionDB, ChunkDB
+from app.models.db.document import ChunkDB, DocumentDB
 from app.providers.embedding.factory import get_embedding
 from app.repositories.qdrant_repo import get_qdrant
 
@@ -26,9 +25,9 @@ logger = get_logger(__name__)
 BATCH_SIZE = 64
 
 # 维度一致性检查结果
-DIM_CHECK_MATCHED = "matched"    # 维度一致
+DIM_CHECK_MATCHED = "matched"  # 维度一致
 DIM_CHECK_RECREATED = "recreated"  # 维度不一致，已重建
-DIM_CHECK_FAILED = "failed"      # 检查失败
+DIM_CHECK_FAILED = "failed"  # 检查失败
 
 
 class QdrantSyncService:
@@ -65,9 +64,7 @@ class QdrantSyncService:
 
         # 查询所有启用的知识库
         async with self.db_factory() as db:
-            result = await db.execute(
-                select(CollectionDB).where(CollectionDB.is_active == True)
-            )
+            result = await db.execute(select(CollectionDB).where(CollectionDB.is_active == True))
             collections = result.scalars().all()
 
         if not collections:
@@ -142,6 +139,7 @@ class QdrantSyncService:
             if not vector_dim:
                 try:
                     from app.providers.embedding.factory import get_embedding
+
                     embedding = await get_embedding()
                     vector_dim = embedding.dimension
                     if not vector_dim or vector_dim <= 0:
@@ -212,21 +210,15 @@ class QdrantSyncService:
                 )
 
         if total_added > 0:
-            logger.info(
-                f"Qdrant sync: collection '{coll_name}' done, {total_added} vectors added"
-            )
+            logger.info(f"Qdrant sync: collection '{coll_name}' done, {total_added} vectors added")
         else:
-            logger.info(
-                f"Qdrant sync: collection '{coll_name}' is up-to-date (0 new vectors)"
-            )
+            logger.info(f"Qdrant sync: collection '{coll_name}' is up-to-date (0 new vectors)")
 
         return total_added
 
     # ---------- 维度一致性检查 ----------
 
-    async def _ensure_dimension_matches(
-        self, coll: CollectionDB, collection_exists: bool
-    ) -> str:
+    async def _ensure_dimension_matches(self, coll: CollectionDB, collection_exists: bool) -> str:
         """
         检查 Qdrant 集合维度是否与当前 embedding 模型匹配。
         如果不匹配，删除旧集合并用正确维度重建（会清空旧向量）。
@@ -238,8 +230,6 @@ class QdrantSyncService:
         """
         if not collection_exists:
             return DIM_CHECK_MATCHED  # 还不存在，创建时会用正确维度
-
-        from app.providers.embedding.factory import get_embedding
 
         try:
             embedding = await get_embedding()
@@ -278,7 +268,9 @@ class QdrantSyncService:
                 db_coll = await db.get(CollectionDB, coll.id)
                 if db_coll:
                     db_coll.vector_dim = expected_dim
-                    db_coll.embedding_model = getattr(embedding, "model_name", "") or db_coll.embedding_model
+                    db_coll.embedding_model = (
+                        getattr(embedding, "model_name", "") or db_coll.embedding_model
+                    )
                     db_coll.chunk_count = 0  # 向量被清空了
                     await db.commit()
 

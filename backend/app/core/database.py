@@ -47,14 +47,25 @@ async_session = async_sessionmaker(
 
 
 async def init_db() -> None:
-    """初始化主数据库表（业务元数据：集合/文档/任务/上传 等）"""
+    """初始化主数据库表（业务元数据：集合/文档/任务/上传/用户 等）"""
     # 导入所有主库模型，确保 Base 能识别
     from app.models.db import (  # noqa: F401
-        collection, directory, document, document_record, task, upload, chat,
+        collection, directory, document, document_record, task, upload, chat, user,
     )
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # 运行主库迁移（如表结构新增列）
+    try:
+        from app.core.migrations import run_migrations_async
+
+        applied = await run_migrations_async(engine, settings.database_url)
+        if applied:
+            logger.info(f"Main database migrations applied: {applied}")
+    except Exception as e:
+        logger.warning(f"Main database migration check failed (non-critical): {e}")
+
     logger.info("Main database initialized.")
 
 

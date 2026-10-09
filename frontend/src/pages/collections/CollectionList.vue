@@ -2,7 +2,7 @@
   <div class="collections-page">
     <div class="page-header flex-between mb-4">
       <h2 class="text-xl font-bold m-0">知识库管理</h2>
-      <el-button type="primary" :icon="Plus" @click="showCreateDialog = true">
+      <el-button v-if="canWriteUser" type="primary" :icon="Plus" @click="showCreateDialog = true">
         新建知识库
       </el-button>
     </div>
@@ -59,7 +59,7 @@
             <el-button type="primary" link size="small" @click="goToDocuments(row)">
               管理
             </el-button>
-            <el-button type="danger" link size="small" @click="handleDelete(row)">
+            <el-button v-if="canWriteUser" type="danger" link size="small" @click="handleDelete(row)">
               删除
             </el-button>
           </template>
@@ -116,14 +116,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { Plus, Search, Collection as CollectionIcon } from '@element-plus/icons-vue'
 import { getCollections, createCollection, deleteCollection, type Collection } from '@/api/collection'
+import { canWrite } from '@/utils/user'
 import dayjs from 'dayjs'
 
 const router = useRouter()
+const canWriteUser = computed(() => canWrite())
 
 const loading = ref(false)
 const collections = ref<Collection[]>([])

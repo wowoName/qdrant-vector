@@ -43,6 +43,7 @@ class DocumentService:
         filename: str,
         content: bytes,
         directory_id: str | None = None,
+        user_id: str | None = None,
     ) -> SimpleUploadResponse:
         """
         单文件上传（小文件直接上传）
@@ -62,6 +63,7 @@ class DocumentService:
                 file_path=tmp_file.name,
                 directory_id=directory_id,
                 delete_after=True,
+                user_id=user_id,
             )
         except Exception:
             # 出错时清理临时文件
@@ -79,6 +81,7 @@ class DocumentService:
         file_hash: str | None = None,
         directory_id: str | None = None,
         delete_after: bool = False,
+        user_id: str | None = None,
     ) -> SimpleUploadResponse:
         """
         从本地文件路径上传（用于分片上传合并后的大文件，避免重复读取内存）
@@ -211,6 +214,7 @@ class DocumentService:
                 "collection_id": collection_id,
                 "file_type": file_type,
             },
+            user_id=user_id,
         )
 
         # 入队执行
@@ -235,6 +239,7 @@ class DocumentService:
         if local_storage_path:
             # 本地存储：直接使用文件复制，避免读入内存
             import shutil
+
             os.makedirs(os.path.dirname(local_storage_path), exist_ok=True)
             shutil.copy2(local_path, local_storage_path)
         else:
@@ -377,8 +382,8 @@ class DocumentService:
 
         return list(items), total
 
-    async def reindex(self, document_id: str) -> str:
-        """重新索引文档"""
+    async def reindex(self, document_id: str, user_id: str | None = None) -> str:
+        """重新索引文档（user_id 用于任务归属）"""
         doc = await self.get_document(document_id)
         version_result = await self.db.execute(
             select(DocumentVersionDB).where(DocumentVersionDB.id == doc.current_version_id)
@@ -411,6 +416,7 @@ class DocumentService:
                 "collection_id": doc.collection_id,
                 "file_type": doc.file_type,
             },
+            user_id=user_id,
         )
         await enqueue_task(task.id)
         await self.db.commit()

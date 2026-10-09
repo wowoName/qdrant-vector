@@ -9,3 +9,4 @@ from .document_record import DocumentRecordDB  # noqa: F401
 from .task import TaskDB  # noqa: F401
 from .upload import UploadSessionDB  # noqa: F401
 from .chat import ConversationDB, MessageDB, ConversationSummaryDB  # noqa: F401
+from .user import UserDB, EmailCodeDB  # noqa: F401

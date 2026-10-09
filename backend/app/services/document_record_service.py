@@ -12,9 +12,7 @@
 - Qdrant = 语义索引（用于语义搜索定位相关记录）
 """
 
-import asyncio
 import uuid
-from typing import AsyncGenerator, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,7 +64,7 @@ class DocumentRecordService:
         """
         processor = ExcelProcessor()
         total = 0
-        batch: List[DocumentRecordDB] = []
+        batch: list[DocumentRecordDB] = []
 
         async for record_item in processor.record_stream(file_path, document_id):
             db_record = self._to_db_record(record_item, document_id, version_id)
@@ -115,9 +113,9 @@ class DocumentRecordService:
         total_records = 0
         total_vectors = 0
 
-        batch_records: List[DocumentRecordDB] = []
-        batch_texts: List[str] = []
-        batch_payloads: List[dict] = []
+        batch_records: list[DocumentRecordDB] = []
+        batch_texts: list[str] = []
+        batch_payloads: list[dict] = []
 
         async for record_item in processor.record_stream(file_path, document_id):
             db_record = self._to_db_record(record_item, document_id, version_id)
@@ -173,9 +171,7 @@ class DocumentRecordService:
                 except Exception as e:
                     logger.error(f"Failed to upsert final vectors batch: {e}")
 
-        logger.info(
-            f"Excel import complete: {total_records} records, {total_vectors} vectors"
-        )
+        logger.info(f"Excel import complete: {total_records} records, {total_vectors} vectors")
         return {"total_records": total_records, "total_vectors": total_vectors}
 
     # ------------------------------------------------------------------
@@ -200,21 +196,21 @@ class DocumentRecordService:
         filters: dict | None = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> List[DocumentRecordDB]:
+    ) -> list[DocumentRecordDB]:
         """按条件查询记录列表"""
         return await self.record_repo.query_records(document_id, filters, limit, offset)
 
-    async def get_record(self, record_id: str) -> Optional[DocumentRecordDB]:
+    async def get_record(self, record_id: str) -> DocumentRecordDB | None:
         """按 ID 获取单条记录"""
         return await self.record_repo.get_by_id(record_id)
 
-    async def list_sheets(self, document_id: str) -> List[str]:
+    async def list_sheets(self, document_id: str) -> list[str]:
         """获取文档中的 sheet 列表"""
         return await self.record_repo.list_sheets(document_id)
 
     async def list_distinct_values(
         self, document_id: str, column: str, limit: int = 200
-    ) -> List[str]:
+    ) -> list[str]:
         """获取某列的去重值列表"""
         return await self.record_repo.list_distinct_values(document_id, column, limit)
 
@@ -243,9 +239,7 @@ class DocumentRecordService:
         rec.data = item.data
         return rec
 
-    def _make_qdrant_payload(
-        self, item: RecordItem, db_record: DocumentRecordDB
-    ) -> dict:
+    def _make_qdrant_payload(self, item: RecordItem, db_record: DocumentRecordDB) -> dict:
         """
         构建 Qdrant payload
 
@@ -275,9 +269,9 @@ class DocumentRecordService:
         self,
         vector_service,
         collection_name: str,
-        records: List[DocumentRecordDB],
-        texts: List[str],
-        payloads: List[dict],
+        records: list[DocumentRecordDB],
+        texts: list[str],
+        payloads: list[dict],
     ):
         """批量向量化并写入 Qdrant"""
         # 生成 embedding
@@ -291,9 +285,7 @@ class DocumentRecordService:
             point_id = str(rec.id)
             rec.qdrant_point_id = point_id
             payload["qdrant_point_id"] = point_id
-            points.append(
-                PointStruct(id=point_id, vector=embedding, payload=payload)
-            )
+            points.append(PointStruct(id=point_id, vector=embedding, payload=payload))
 
         # 写入 Qdrant
         await vector_service.qdrant_repo.upsert_points(collection_name, points)

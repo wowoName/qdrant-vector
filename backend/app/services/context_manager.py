@@ -22,7 +22,6 @@
   6. 当前用户问题
 """
 
-from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
 
 from app.core.config import settings
@@ -36,40 +35,44 @@ logger = get_logger(__name__)
 @dataclass
 class SummaryBundle:
     """分层摘要包"""
-    far: Optional[str] = None   # 远期（粗粒度）
-    mid: Optional[str] = None   # 中期（中粒度）
-    near: Optional[str] = None  # 近期（细粒度滚动摘要）
+
+    far: str | None = None  # 远期（粗粒度）
+    mid: str | None = None  # 中期（中粒度）
+    near: str | None = None  # 近期（细粒度滚动摘要）
 
 
 @dataclass
 class HistoryMessage:
     """历史消息（内部表示）"""
+
     seq: int
     turn_id: int
     role: str
     content: str
     token_count: int = 0
     is_key_turn: bool = False
-    tool_name: Optional[str] = None  # 工具调用名（用于工具结果裁剪识别）
-    is_tool_result: bool = False     # 是否为工具结果消息
+    tool_name: str | None = None  # 工具调用名（用于工具结果裁剪识别）
+    is_tool_result: bool = False  # 是否为工具结果消息
 
 
 @dataclass
 class ContextAssemblyResult:
     """上下文组装结果"""
-    messages: List[ChatMessage]     # 最终发给模型的消息列表
-    total_tokens: int               # 总 token 数
-    recent_start_seq: int           # 近期完整消息起始 seq
-    used_summary_levels: List[str]  # 实际使用的摘要层级
-    applied_strategies: List[str] = field(default_factory=list)  # 实际应用的策略
+
+    messages: list[ChatMessage]  # 最终发给模型的消息列表
+    total_tokens: int  # 总 token 数
+    recent_start_seq: int  # 近期完整消息起始 seq
+    used_summary_levels: list[str]  # 实际使用的摘要层级
+    applied_strategies: list[str] = field(default_factory=list)  # 实际应用的策略
 
 
 @dataclass
 class StrategyResult:
     """单个策略的执行结果"""
-    messages: List[dict]            # 处理后的消息列表
-    tokens_saved: int               # 节省的 token 数
-    strategy_name: str              # 策略名称
+
+    messages: list[dict]  # 处理后的消息列表
+    tokens_saved: int  # 节省的 token 数
+    strategy_name: str  # 策略名称
 
 
 class BaseCompactionStrategy:
@@ -79,7 +82,7 @@ class BaseCompactionStrategy:
 
     def apply(
         self,
-        messages: List[dict],
+        messages: list[dict],
         budget: int,
         current_tokens: int,
     ) -> StrategyResult:
@@ -112,7 +115,7 @@ class ToolResultPruningStrategy(BaseCompactionStrategy):
 
     def apply(
         self,
-        messages: List[dict],
+        messages: list[dict],
         budget: int,
         current_tokens: int,
     ) -> StrategyResult:
@@ -180,7 +183,7 @@ class SummarizationStrategy(BaseCompactionStrategy):
 
     def apply(
         self,
-        messages: List[dict],
+        messages: list[dict],
         budget: int,
         current_tokens: int,
     ) -> StrategyResult:
@@ -256,7 +259,9 @@ class SummarizationStrategy(BaseCompactionStrategy):
             # 构造摘要消息（用一条 user 消息承载摘要上下文）
             summary_text_parts = []
             for level, text, _ in summary_candidates:
-                label = {"far": "更早的对话", "mid": "中期对话", "near": "近期对话"}.get(level, level)
+                label = {"far": "更早的对话", "mid": "中期对话", "near": "近期对话"}.get(
+                    level, level
+                )
                 summary_text_parts.append(f"[{label}摘要]\n{text}")
 
             summary_block = "\n\n".join(summary_text_parts)
@@ -280,11 +285,13 @@ class SummarizationStrategy(BaseCompactionStrategy):
 
             saved = replaced_tokens - total_summary_tokens
             logger.debug(f"Summarization: saved {saved} tokens, replaced {replace_count} turns")
-            return StrategyResult(messages=result_messages, tokens_saved=saved, strategy_name=self.name)
+            return StrategyResult(
+                messages=result_messages, tokens_saved=saved, strategy_name=self.name
+            )
 
         return StrategyResult(messages=messages, tokens_saved=0, strategy_name=self.name)
 
-    def _group_by_turn(self, messages: List[dict]) -> List[Tuple[int, List[dict]]]:
+    def _group_by_turn(self, messages: list[dict]) -> list[tuple[int, list[dict]]]:
         """按 turn_id 分组"""
         turns = []
         current_turn = None
@@ -324,7 +331,7 @@ class SlidingWindowStrategy(BaseCompactionStrategy):
 
     def apply(
         self,
-        messages: List[dict],
+        messages: list[dict],
         budget: int,
         current_tokens: int,
     ) -> StrategyResult:
@@ -354,8 +361,7 @@ class SlidingWindowStrategy(BaseCompactionStrategy):
         # 先保证最近的 min_turns 轮一定在
         for i in range(len(turns) - 1, max(-1, len(turns) - self.min_turns - 1), -1):
             turn_toks = sum(
-                m.get("token_count") or count_tokens(m.get("content", ""))
-                for m in turns[i][1]
+                m.get("token_count") or count_tokens(m.get("content", "")) for m in turns[i][1]
             )
             selected_indices.append(i)
             total_toks += turn_toks
@@ -365,8 +371,7 @@ class SlidingWindowStrategy(BaseCompactionStrategy):
         for i in range(len(turns) - self.min_turns - 1, -1, -1):
             if i in key_turn_indices:
                 turn_toks = sum(
-                    m.get("token_count") or count_tokens(m.get("content", ""))
-                    for m in turns[i][1]
+                    m.get("token_count") or count_tokens(m.get("content", "")) for m in turns[i][1]
                 )
                 if total_toks + turn_toks <= budget:
                     selected_indices.append(i)
@@ -376,8 +381,7 @@ class SlidingWindowStrategy(BaseCompactionStrategy):
         for i in range(len(turns) - self.min_turns - 1, -1, -1):
             if i not in selected_indices and i not in key_turn_indices:
                 turn_toks = sum(
-                    m.get("token_count") or count_tokens(m.get("content", ""))
-                    for m in turns[i][1]
+                    m.get("token_count") or count_tokens(m.get("content", "")) for m in turns[i][1]
                 )
                 if total_toks + turn_toks <= budget:
                     selected_indices.append(i)
@@ -404,7 +408,7 @@ class SlidingWindowStrategy(BaseCompactionStrategy):
         )
         return StrategyResult(messages=result, tokens_saved=saved, strategy_name=self.name)
 
-    def _group_by_turn(self, messages: List[dict]) -> List[Tuple[int, List[dict]]]:
+    def _group_by_turn(self, messages: list[dict]) -> list[tuple[int, list[dict]]]:
         """按 turn_id 分组"""
         turns = []
         current_turn = None
@@ -442,7 +446,7 @@ class TruncationStrategy(BaseCompactionStrategy):
 
     def apply(
         self,
-        messages: List[dict],
+        messages: list[dict],
         budget: int,
         current_tokens: int,
     ) -> StrategyResult:
@@ -527,7 +531,7 @@ class TokenBudgetComposedStrategy:
         sliding_min_turns: int = 2,
         trunc_min_messages: int = 2,
     ):
-        self.strategies: List[BaseCompactionStrategy] = [
+        self.strategies: list[BaseCompactionStrategy] = [
             ToolResultPruningStrategy(
                 max_tool_result_tokens=tool_max_tokens,
                 keep_recent=tool_keep_recent,
@@ -539,9 +543,9 @@ class TokenBudgetComposedStrategy:
 
     def apply(
         self,
-        messages: List[dict],
+        messages: list[dict],
         budget: int,
-    ) -> Tuple[List[dict], List[str]]:
+    ) -> tuple[list[dict], list[str]]:
         """按顺序执行策略，直到满足预算
 
         Args:
@@ -555,8 +559,7 @@ class TokenBudgetComposedStrategy:
             return [], []
 
         current_tokens = sum(
-            m.get("token_count") or count_tokens(m.get("content", ""))
-            for m in messages
+            m.get("token_count") or count_tokens(m.get("content", "")) for m in messages
         )
 
         if current_tokens <= budget:
@@ -567,8 +570,7 @@ class TokenBudgetComposedStrategy:
 
         for strategy in self.strategies:
             current_tokens = sum(
-                m.get("token_count") or count_tokens(m.get("content", ""))
-                for m in result
+                m.get("token_count") or count_tokens(m.get("content", "")) for m in result
             )
             if current_tokens <= budget:
                 break
@@ -598,9 +600,9 @@ class ContextWindowManager:
 
     def __init__(
         self,
-        window_tokens: Optional[int] = None,
-        reserve_tokens: Optional[int] = None,
-        recent_turns: Optional[int] = None,
+        window_tokens: int | None = None,
+        reserve_tokens: int | None = None,
+        recent_turns: int | None = None,
     ):
         self.window_tokens = window_tokens or settings.chat_context_window_tokens
         self.reserve_tokens = reserve_tokens or settings.chat_context_reserve_tokens
@@ -616,9 +618,9 @@ class ContextWindowManager:
         self,
         system_prompt: str,
         current_query: str,
-        history_messages: List[dict],
+        history_messages: list[dict],
         summaries: SummaryBundle,
-        key_turn_seqs: Optional[List[int]] = None,
+        key_turn_seqs: list[int] | None = None,
     ) -> ContextAssemblyResult:
         """组装发给模型的消息列表
 
@@ -655,18 +657,16 @@ class ContextWindowManager:
             trunc_min_messages=2,
         )
 
-        compressed_history, applied_strategies = composed.apply(
-            history_messages, available
-        )
+        compressed_history, applied_strategies = composed.apply(history_messages, available)
 
         # ---- 构造最终消息列表 ----
-        messages: List[ChatMessage] = []
+        messages: list[ChatMessage] = []
 
         # 1. system prompt
         messages.append(ChatMessage("system", system_prompt))
 
         # 2. 添加压缩后的历史消息
-        used_summary_levels: List[str] = []
+        used_summary_levels: list[str] = []
         for m in compressed_history:
             if m.get("_is_summary"):
                 # 摘要消息已经是 system 角色的内容了

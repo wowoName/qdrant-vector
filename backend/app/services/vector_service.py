@@ -3,7 +3,6 @@
 """
 
 import time
-from typing import List
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,9 +27,9 @@ class VectorService:
     async def _search_one_collection(
         self,
         collection_id: str,
-        query_vector: List[float],
+        query_vector: list[float],
         req: SearchRequest,
-    ) -> List[dict]:
+    ) -> list[dict]:
         """在单个 collection 中搜索，返回原始 hit 列表"""
         # 维度一致性检查：如果查询向量维度与集合不匹配，跳过该集合
         # （可能是切换模型后旧集合还没重建）
@@ -62,7 +61,7 @@ class VectorService:
             hit["collection_id"] = collection_id
         return results
 
-    def _build_results(self, hits: List[dict], top_k: int) -> List[SearchResult]:
+    def _build_results(self, hits: list[dict], top_k: int) -> list[SearchResult]:
         """将原始 hits 组装为 SearchResult 列表，并按分数排序取 top_k"""
         # 按分数降序排序
         hits_sorted = sorted(hits, key=lambda h: h.get("score", 0.0), reverse=True)
@@ -110,8 +109,13 @@ class VectorService:
 
         return search_results
 
-    async def search(self, collection_id: str, req: SearchRequest) -> SearchResponse:
-        """语义检索。collection_id 为 'all' 或空时，搜索所有启用的知识库"""
+    async def search(
+        self,
+        collection_id: str,
+        req: SearchRequest,
+        visible_ids: list[str] | None = None,
+    ) -> SearchResponse:
+        """语义检索。collection_id 为 'all' 或空时，搜索可见范围内的所有启用知识库"""
         start_time = time.time()
 
         # 向量化查询
@@ -122,13 +126,14 @@ class VectorService:
         is_cross_collection = collection_id == "all" or not collection_id
 
         if is_cross_collection:
-            # 查询所有启用的 collection
-            result = await self.db.execute(
-                select(CollectionDB).where(CollectionDB.is_active == True)
-            )
+            # 查询可见范围内的启用 collection（SaaS 隔离）
+            stmt = select(CollectionDB).where(CollectionDB.is_active == True)
+            if visible_ids is not None:
+                stmt = stmt.where(CollectionDB.owner_user_id.in_(visible_ids))
+            result = await self.db.execute(stmt)
             collections = result.scalars().all()
 
-            all_hits: List[dict] = []
+            all_hits: list[dict] = []
             for coll in collections:
                 try:
                     hits = await self._search_one_collection(coll.id, query_vector, req)
@@ -139,9 +144,9 @@ class VectorService:
 
             search_results = self._build_results(all_hits, req.top_k)
         else:
-            # 校验 Collection
+            # 校验 Collection（含归属校验）
             coll_svc = CollectionService(self.db)
-            await coll_svc.get_by_id(collection_id)
+            await coll_svc.get_by_id(collection_id, visible_ids=visible_ids)
 
             hits = await self._search_one_collection(collection_id, query_vector, req)
             search_results = self._build_results(hits, req.top_k)

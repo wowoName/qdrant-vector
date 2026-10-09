@@ -80,6 +80,22 @@ class UnauthorizedError(AppException):
         )
 
 
+class AuthError(UnauthorizedError):
+    """认证/授权错误（未登录、token 无效、账号禁用、无权限）"""
+
+    def __init__(self, message: str = "Authentication failed", status_code: int = 401):
+        super().__init__(message=message)
+        self.status_code = status_code
+        self.code = 40100 if status_code == 401 else 40300
+
+
+class ForbiddenError(AuthError):
+    """禁止访问"""
+
+    def __init__(self, message: str = "Forbidden"):
+        super().__init__(message=message, status_code=403)
+
+
 # ---------- 5xx 服务端错误 ----------
 
 class InternalError(AppException):

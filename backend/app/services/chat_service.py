@@ -92,11 +92,18 @@ class ChatService:
         chat_db: 对话数据库会话（会话/消息/摘要，独立存储）
     """
 
-    def __init__(self, db: AsyncSession, chat_db: AsyncSession | None = None):
+    def __init__(
+        self,
+        db: AsyncSession,
+        chat_db: AsyncSession | None = None,
+        visible_ids: list[str] | None = None,
+    ):
         # 主库：业务元数据（集合/文档/向量索引等）
         self.db = db
         # 对话库：会话/消息/摘要（未指定则复用主库，保持兼容）
         self.chat_db = chat_db if chat_db is not None else db
+        # SaaS 可见范围（None 表示不做过滤，内部/测试场景）
+        self.visible_ids = visible_ids
         self.vector_service = VectorService(db)
         self.conv_repo = ConversationRepository(self.chat_db)
         self.context_mgr = ContextWindowManager()
@@ -130,29 +137,41 @@ class ChatService:
         # 各类型的关键词模式（按优先级从高到低判断）
         patterns = [
             # --- 需要最多数据：列表 / 汇总 / 统计 / 全部 ---
-            (20, [
-                r"有哪些|列出|列表|汇总|全部|所有|分别是|都是|都有|共有|合计|总计",
-                r"清单|明细|目录|名单|一览表",
-                r"多少种|多少个|有多少种|有几个",
-            ]),
+            (
+                20,
+                [
+                    r"有哪些|列出|列表|汇总|全部|所有|分别是|都是|都有|共有|合计|总计",
+                    r"清单|明细|目录|名单|一览表",
+                    r"多少种|多少个|有多少种|有几个",
+                ],
+            ),
             # --- 对比/分析类：需要多角度 ---
-            (12, [
-                r"对比|比较|区别|差异|优劣势|优缺点",
-                r"分析|影响因素|为什么|原因",
-                r"关系|关联|联系",
-            ]),
+            (
+                12,
+                [
+                    r"对比|比较|区别|差异|优劣势|优缺点",
+                    r"分析|影响因素|为什么|原因",
+                    r"关系|关联|联系",
+                ],
+            ),
             # --- 总结/概括类：较全面 ---
-            (8, [
-                r"总结|概括|概述|简介|介绍一下|概况",
-                r"主要内容|核心要点|重点",
-                r"过程|步骤|流程|方法",
-            ]),
+            (
+                8,
+                [
+                    r"总结|概括|概述|简介|介绍一下|概况",
+                    r"主要内容|核心要点|重点",
+                    r"过程|步骤|流程|方法",
+                ],
+            ),
             # --- 存在性 / 简单事实：少量即可 ---
-            (3, [
-                r"有没有|是否存在|是否有",
-                r"是什么|什么是|定义|含义|概念",
-                r"谁是|是哪个|哪一个",
-            ]),
+            (
+                3,
+                [
+                    r"有没有|是否存在|是否有",
+                    r"是什么|什么是|定义|含义|概念",
+                    r"谁是|是哪个|哪一个",
+                ],
+            ),
         ]
 
         for k, pats in patterns:
@@ -233,7 +252,11 @@ class ChatService:
                 smart_query_result = None
 
         # 如果 SmartQuery 成功返回了结果，直接使用
-        if smart_query_result and smart_query_result.get("success") and smart_query_result.get("answer"):
+        if (
+            smart_query_result
+            and smart_query_result.get("success")
+            and smart_query_result.get("answer")
+        ):
             sq_answer = smart_query_result["answer"]
             sq_references = smart_query_result.get("references", [])
             sq_is_kb = smart_query_result.get("is_kb_answer", True)
@@ -266,8 +289,22 @@ class ChatService:
             # 触发压缩
             try:
                 updated_history = history_msgs + [
-                    {"seq": conv.message_count - 2, "turn_id": current_turn, "role": "user", "content": req.query, "token_count": 0, "is_key_turn": False},
-                    {"seq": conv.message_count - 1, "turn_id": current_turn, "role": "assistant", "content": sq_answer, "token_count": 0, "is_key_turn": False},
+                    {
+                        "seq": conv.message_count - 2,
+                        "turn_id": current_turn,
+                        "role": "user",
+                        "content": req.query,
+                        "token_count": 0,
+                        "is_key_turn": False,
+                    },
+                    {
+                        "seq": conv.message_count - 1,
+                        "turn_id": current_turn,
+                        "role": "assistant",
+                        "content": sq_answer,
+                        "token_count": 0,
+                        "is_key_turn": False,
+                    },
                 ]
                 await self.compaction_service.maybe_compact(conv.id, session_id, updated_history)
             except Exception as e:
@@ -298,14 +335,10 @@ class ChatService:
             score_threshold=0.0,
         )
         try:
-            search_result = await self.vector_service.search(
-                search_collection_id, search_req
-            )
+            search_result = await self.vector_service.search(search_collection_id, search_req, visible_ids=self.visible_ids)
         except (QdrantConnectionError, QdrantCollectionNotFoundError) as e:
             # Qdrant 不可达或集合不存在：降级为直接 LLM 回答
-            logger.warning(
-                f"Vector search unavailable, falling back to direct LLM answer: {e}"
-            )
+            logger.warning(f"Vector search unavailable, falling back to direct LLM answer: {e}")
             search_result = None
         except QdrantError as e:
             # 其他 Qdrant 错误：同样降级，保证可用性
@@ -327,12 +360,10 @@ class ChatService:
                         score_threshold=0.0,
                     )
                     fallback_result = await self.vector_service.search(
-                        search_collection_id, fallback_req
+                        search_collection_id, fallback_req, visible_ids=self.visible_ids
                     )
                     if fallback_result and fallback_result.results:
-                        fallback_max = max(
-                            (r.score for r in fallback_result.results), default=0.0
-                        )
+                        fallback_max = max((r.score for r in fallback_result.results), default=0.0)
                         if fallback_max > max_score:
                             search_result = fallback_result
                             query_for_search = req.query
@@ -375,7 +406,11 @@ class ChatService:
                 f"using direct LLM answer for query: '{req.query[:50]}...'"
             )
         elif not is_kb_answer:
-            mode = "all collections" if not effective_collection_id else f"collection {effective_collection_id}"
+            mode = (
+                "all collections"
+                if not effective_collection_id
+                else f"collection {effective_collection_id}"
+            )
             logger.info(
                 f"Knowledge base not hit (low score, {mode}), "
                 f"using direct LLM answer for query: '{req.query[:50]}...'"
@@ -383,9 +418,7 @@ class ChatService:
 
         # 8. 组装上下文（用 ContextWindowManager 做 token 预算和分层历史）
         if is_kb_answer:
-            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-                context=self._build_context(references)
-            )
+            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(context=self._build_context(references))
         else:
             system_prompt = DIRECT_LLM_SYSTEM_PROMPT
 
@@ -557,7 +590,11 @@ class ChatService:
                     smart_query_result = None
 
             # 如果 SmartQuery 成功返回了结果，直接流式返回
-            if smart_query_result and smart_query_result.get("success") and smart_query_result.get("answer"):
+            if (
+                smart_query_result
+                and smart_query_result.get("success")
+                and smart_query_result.get("answer")
+            ):
                 sq_answer = smart_query_result["answer"]
                 sq_references = smart_query_result.get("references", [])
                 sq_is_kb = smart_query_result.get("is_kb_answer", True)
@@ -590,10 +627,26 @@ class ChatService:
                 # 触发压缩
                 try:
                     updated_history = history_msgs + [
-                        {"seq": conv.message_count - 2, "turn_id": current_turn, "role": "user", "content": req.query, "token_count": 0, "is_key_turn": False},
-                        {"seq": conv.message_count - 1, "turn_id": current_turn, "role": "assistant", "content": sq_answer, "token_count": 0, "is_key_turn": False},
+                        {
+                            "seq": conv.message_count - 2,
+                            "turn_id": current_turn,
+                            "role": "user",
+                            "content": req.query,
+                            "token_count": 0,
+                            "is_key_turn": False,
+                        },
+                        {
+                            "seq": conv.message_count - 1,
+                            "turn_id": current_turn,
+                            "role": "assistant",
+                            "content": sq_answer,
+                            "token_count": 0,
+                            "is_key_turn": False,
+                        },
                     ]
-                    await self.compaction_service.maybe_compact(conv.id, session_id, updated_history)
+                    await self.compaction_service.maybe_compact(
+                        conv.id, session_id, updated_history
+                    )
                 except Exception as e:
                     logger.warning(f"Compaction after smart query (stream) failed: {e}")
 
@@ -628,16 +681,16 @@ class ChatService:
             search_collection_id = effective_collection_id or "all"
             # 智能计算 top_k：根据查询类型动态调整
             vector_top_k = self._calc_vector_top_k(query_for_search, default_k=req.top_k)
-            logger.debug(f"Vector search top_k (stream): requested={req.top_k}, resolved={vector_top_k}")
+            logger.debug(
+                f"Vector search top_k (stream): requested={req.top_k}, resolved={vector_top_k}"
+            )
             search_req = SearchRequest(
                 query=query_for_search,
                 top_k=vector_top_k,
                 score_threshold=0.0,
             )
             try:
-                search_result = await self.vector_service.search(
-                    search_collection_id, search_req
-                )
+                search_result = await self.vector_service.search(search_collection_id, search_req, visible_ids=self.visible_ids)
             except (QdrantConnectionError, QdrantCollectionNotFoundError) as e:
                 logger.warning(
                     f"Vector search unavailable, falling back to direct LLM answer (stream): {e}"
@@ -664,7 +717,7 @@ class ChatService:
                             score_threshold=0.0,
                         )
                         fallback_result = await self.vector_service.search(
-                            search_collection_id, fallback_req
+                            search_collection_id, fallback_req, visible_ids=self.visible_ids
                         )
                         if fallback_result and fallback_result.results:
                             fallback_max = max(
@@ -732,9 +785,7 @@ class ChatService:
 
         # 8. 组装上下文
         if is_kb_answer:
-            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-                context=self._build_context(references)
-            )
+            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(context=self._build_context(references))
         else:
             system_prompt = DIRECT_LLM_SYSTEM_PROMPT
 
@@ -852,7 +903,7 @@ class ChatService:
             for cmd_name, desc in SUPPORTED_COMMANDS.items():
                 help_text += f"- `{cmd_name}` - {desc}\n"
             help_text += "\n**使用示例：**\n"
-            help_text += '- `/kb 产品文档` - 切换到「产品文档」知识库\n'
+            help_text += "- `/kb 产品文档` - 切换到「产品文档」知识库\n"
             help_text += "- `/kb` - 查看当前绑定的知识库\n"
             help_text += "- `/clear` - 清空当前对话\n"
             return {"command": "/help", "response": help_text, "action": "help"}
@@ -915,9 +966,7 @@ class ChatService:
         Returns:
             (会话列表, 总数)
         """
-        convs = await self.conv_repo.list_all(
-            user_id=user_id, limit=limit, offset=offset
-        )
+        convs = await self.conv_repo.list_all(user_id=user_id, limit=limit, offset=offset)
         total = await self.conv_repo.count_all(user_id=user_id)
         return [ConversationSchema.from_db(c) for c in convs], total
 
@@ -926,27 +975,45 @@ class ChatService:
         collection_id: str,
         limit: int = 50,
         offset: int = 0,
+        user_id: str | None = None,
     ) -> list[ConversationSchema]:
-        """列出会话列表"""
+        """列出会话列表（user_id 传入时仅返回本人会话）"""
         convs = await self.conv_repo.list_by_collection(
             collection_id=collection_id,
+            user_id=user_id,
             limit=limit,
             offset=offset,
         )
         return [ConversationSchema.from_db(c) for c in convs]
 
-    async def get_conversation(self, session_id: str) -> ConversationSchema | None:
-        """获取会话详情（含消息列表）"""
+    async def get_conversation(
+        self, session_id: str, user_id: str | None = None
+    ) -> ConversationSchema | None:
+        """获取会话详情（含消息列表）
+
+        user_id 传入时校验会话归属，非本人会话视为不存在。
+        """
         conv = await self.conv_repo.get_by_session_id(session_id)
         if not conv:
+            return None
+        if user_id and conv.user_id and conv.user_id != user_id:
             return None
         msgs = await self.conv_repo.get_messages(conv.id, session_id)
         schema = ConversationSchema.from_db(conv)
         schema.messages = [ChatMessageSchema(role=m.role, content=m.content) for m in msgs]
         return schema
 
-    async def delete_conversation(self, session_id: str) -> bool:
-        """删除（归档）会话"""
+    async def delete_conversation(
+        self, session_id: str, user_id: str | None = None
+    ) -> bool:
+        """删除（归档）会话
+
+        user_id 传入时校验会话归属，非本人会话不允许删除。
+        """
+        if user_id:
+            conv = await self.conv_repo.get_by_session_id(session_id)
+            if not conv or (conv.user_id and conv.user_id != user_id):
+                return False
         return await self.conv_repo.delete(session_id)
 
     # ========== 内部方法 ==========
@@ -1047,6 +1114,7 @@ class ChatService:
                 self._smart_query_orchestrator = SmartQueryOrchestrator(
                     db=self.db,
                     collection_id="",
+                    visible_ids=self.visible_ids,
                 )
             except Exception as e:
                 logger.error(f"Failed to init SmartQueryOrchestrator: {e}")
@@ -1099,7 +1167,12 @@ class ChatService:
             use_result = False
 
             # 情况1：SQL 查询成功且有数据
-            if result.used_sql and result.sql_result and result.sql_result.success and result.sql_result.rows:
+            if (
+                result.used_sql
+                and result.sql_result
+                and result.sql_result.success
+                and result.sql_result.rows
+            ):
                 use_result = True
 
             # 情况2：高置信度的结构化查询（即使无数据也用 SmartQuery 明确说明未找到）

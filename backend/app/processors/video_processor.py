@@ -2,8 +2,6 @@
 视频文档处理器（抽帧 OCR + 音频 ASR）
 """
 
-from typing import List
-
 from .text_processor import TextDocumentProcessor
 
 
@@ -12,7 +10,8 @@ class VideoProcessor(TextDocumentProcessor):
 
     def _create_parser(self):
         from app.parsers.video_parser import VideoParser
+
         return VideoParser()
 
-    def supported_types(self) -> List[str]:
+    def supported_types(self) -> list[str]:
         return ["mp4", "avi", "mkv", "mov", "flv", "wmv", "webm", "video"]

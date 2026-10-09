@@ -51,14 +51,20 @@ class ConversationRepository:
         Args:
             session_id: 会话 ID，不传则自动生成
             collection_id: 知识库集合 ID（可选，为 None 表示通用对话）
-            user_id: 用户 ID（可选）
+            user_id: 用户 ID（SaaS 隔离：传入时校验会话归属，创建时强制写入）
 
         Returns:
             (conversation, created)
+
+        Raises:
+            PermissionError: 会话存在但不属于该用户
         """
         if session_id:
             conv = await self.get_by_session_id(session_id)
             if conv:
+                # SaaS 隔离：会话归属校验（user_id 已知时不允许访问他人会话）
+                if user_id and conv.user_id and conv.user_id != user_id:
+                    raise PermissionError("无权访问该会话")
                 # 如果会话已存在但 collection_id 变化了，更新 collection_id
                 # （支持在对话过程中切换知识库）
                 if collection_id and conv.collection_id != collection_id:

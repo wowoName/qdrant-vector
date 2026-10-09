@@ -12,22 +12,22 @@ LLM Provider 工厂
 - openai: OpenAI 官方
 """
 
-from typing import Dict, Optional
 import logging
 
 from app.core.config import settings
-from .base import BaseLLM, ChatMessage, ChatResponse
+
 from .ark import ArkLLM
+from .base import BaseLLM, ChatMessage, ChatResponse
 from .deepseek import DeepSeekLLM
-from .qwen import QwenLLM
 from .ollama import OllamaLLM
 from .openai import OpenAILLM
 from .openai_compatible import OpenAICompatibleLLM
+from .qwen import QwenLLM
 
 logger = logging.getLogger(__name__)
 
 # 已创建的 LLM 实例缓存（按 provider+model 维度）
-_llm_cache: Dict[str, BaseLLM] = {}
+_llm_cache: dict[str, BaseLLM] = {}
 
 
 def _cache_key(provider: str, model: str) -> str:
@@ -35,8 +35,8 @@ def _cache_key(provider: str, model: str) -> str:
 
 
 def create_llm(
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
+    provider: str | None = None,
+    model: str | None = None,
     force_new: bool = False,
 ) -> BaseLLM:
     """
@@ -217,8 +217,8 @@ def _create_openai_llm(model: str) -> OpenAILLM:
 
 
 async def test_llm_connection(
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> dict:
     """测试 LLM 连接是否正常
 
@@ -254,6 +254,7 @@ async def test_llm_connection(
 
 
 # ---------- 按场景获取模型 ----------
+
 
 def get_chat_llm() -> BaseLLM:
     """获取对话场景使用的 LLM"""

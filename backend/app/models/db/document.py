@@ -4,9 +4,15 @@ Document & DocumentVersion & Chunk ORM 模型
 
 import uuid
 from datetime import datetime
+
 from sqlalchemy import (
-    Column, String, Integer, BigInteger, Text, DateTime,
-    ForeignKey, Index,
+    BigInteger,
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
 )
 
 from app.core.database import Base
@@ -29,9 +35,7 @@ class DocumentDB(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    __table_args__ = (
-        Index("idx_collection_directory", "collection_id", "directory_id"),
-    )
+    __table_args__ = (Index("idx_collection_directory", "collection_id", "directory_id"),)
 
 
 class DocumentVersionDB(Base):
@@ -49,9 +53,7 @@ class DocumentVersionDB(Base):
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    __table_args__ = (
-        Index("idx_doc_version", "document_id", "version_num"),
-    )
+    __table_args__ = (Index("idx_doc_version", "document_id", "version_num"),)
 
 
 class ChunkDB(Base):
@@ -71,6 +73,4 @@ class ChunkDB(Base):
     token_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    __table_args__ = (
-        Index("idx_version_index", "version_id", "chunk_index", unique=True),
-    )
+    __table_args__ = (Index("idx_version_index", "version_id", "chunk_index", unique=True),)

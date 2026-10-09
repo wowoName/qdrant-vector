@@ -8,16 +8,17 @@
 3. 资源可控（用完即 close，不会常驻内存）
 """
 
-from typing import Dict, Callable, Optional
+from collections.abc import Callable
 
-from .base import BaseDocumentProcessor
 from app.core.exceptions import UnsupportedFileTypeError
 from app.core.logging import get_logger
+
+from .base import BaseDocumentProcessor
 
 logger = get_logger(__name__)
 
 # 类型 → 处理器构造函数的映射（延迟导入，避免循环依赖）
-_provider_factories: Dict[str, Callable[[str], BaseDocumentProcessor]] = {}
+_provider_factories: dict[str, Callable[[str], BaseDocumentProcessor]] = {}
 _initialized = False
 
 
@@ -27,16 +28,16 @@ def _register_factories() -> None:
     if _initialized:
         return
 
-    from .excel_processor import ExcelProcessor
+    from .audio_processor import AudioProcessor
     from .csv_processor import CSVProcessor
-    from .pdf_processor import PDFProcessor
     from .docx_processor import DOCXProcessor
-    from .ppt_processor import PPTProcessor
-    from .txt_processor import TXTProcessor
-    from .markdown_processor import MarkdownProcessor
+    from .excel_processor import ExcelProcessor
     from .html_processor import HTMLProcessor
     from .image_processor import ImageProcessor
-    from .audio_processor import AudioProcessor
+    from .markdown_processor import MarkdownProcessor
+    from .pdf_processor import PDFProcessor
+    from .ppt_processor import PPTProcessor
+    from .txt_processor import TXTProcessor
     from .video_processor import VideoProcessor
 
     # 每种文件类型对应一个构造器 lambda，调用时才创建实例
@@ -123,7 +124,7 @@ def get_processor(file_type: str) -> BaseDocumentProcessor:
     return factory(ftype)
 
 
-def get_all_processor_types() -> Dict[str, str]:
+def get_all_processor_types() -> dict[str, str]:
     """
     获取所有支持的文件类型及其对应的处理器类名。
     用于展示或调试。

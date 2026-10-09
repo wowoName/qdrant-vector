@@ -1,20 +1,17 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
-import { getUserId } from './user'
+import { authHeader, clearAuth } from './user'
+import router from '@/router'
 
 const request = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
   timeout: 60000,
 })
 
-// 请求拦截器
+// 请求拦截器：携带 JWT
 request.interceptors.request.use(
   (config) => {
-    // 自动携带用户标识
-    const userId = getUserId()
-    if (userId) {
-      config.headers['X-User-ID'] = userId
-    }
+    Object.assign(config.headers, authHeader())
     return config
   },
   (error) => {
@@ -33,8 +30,21 @@ request.interceptors.response.use(
     return Promise.reject(data)
   },
   (error) => {
-    const message = error.response?.data?.message || error.message || '网络错误'
-    ElMessage.error(message)
+    const status = error.response?.status
+    const message =
+      error.response?.data?.message || error.response?.data?.detail || error.message || '网络错误'
+
+    // 未登录 / token 失效：清除登录态并跳转登录页
+    if (status === 401) {
+      clearAuth()
+      if (router.currentRoute.value.path !== '/login') {
+        ElMessage.error('登录已过期，请重新登录')
+        router.push('/login')
+      }
+      return Promise.reject(error)
+    }
+
+    ElMessage.error(typeof message === 'string' ? message : '请求失败')
     return Promise.reject(error)
   }
 )

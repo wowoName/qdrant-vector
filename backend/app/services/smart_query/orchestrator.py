@@ -88,6 +88,7 @@ class SmartQueryOrchestrator:
         self,
         db: AsyncSession,
         collection_id: str = "",
+        visible_ids: Optional[list] = None,
         router_agent: Optional[RouterAgent] = None,
         sql_retriever: Optional[SQLRetriever] = None,
         vector_retriever: Optional[VectorRetriever] = None,
@@ -98,6 +99,8 @@ class SmartQueryOrchestrator:
     ):
         self.db = db
         self.collection_id = collection_id
+        # SaaS 可见范围（None 表示不过滤）
+        self.visible_ids = visible_ids
         self.storage = get_storage()
 
         # 共享 SchemaProvider（避免重复加载数据）
@@ -1416,8 +1419,8 @@ class SmartQueryOrchestrator:
             is_cross_collection = not collection_id or collection_id == "all"
 
             if is_cross_collection:
-                # 跨库查询：查找所有启用的知识库中的表格文件
-                result = await self.db.execute(
+                # 跨库查询：查找可见范围内所有启用的知识库中的表格文件（SaaS 隔离）
+                stmt = (
                     select(DocumentDB, DocumentVersionDB, CollectionDB)
                     .join(DocumentVersionDB, DocumentDB.current_version_id == DocumentVersionDB.id)
                     .join(CollectionDB, DocumentDB.collection_id == CollectionDB.id)
@@ -1429,6 +1432,9 @@ class SmartQueryOrchestrator:
                     .order_by(DocumentDB.updated_at.desc())
                     .limit(self.max_sql_files)
                 )
+                if self.visible_ids is not None:
+                    stmt = stmt.where(CollectionDB.owner_user_id.in_(self.visible_ids))
+                result = await self.db.execute(stmt)
                 rows = result.all()
 
                 table_files = []

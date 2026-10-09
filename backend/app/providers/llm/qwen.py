@@ -6,8 +6,6 @@
 - 认证: Authorization: Bearer {api_key}
 """
 
-from typing import Optional
-
 from .openai_compatible import OpenAICompatibleLLM
 
 
@@ -17,7 +15,7 @@ class QwenLLM(OpenAICompatibleLLM):
     def __init__(
         self,
         model: str = "qwen-plus",
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
         temperature: float = 0.7,
         max_tokens: int = 2048,

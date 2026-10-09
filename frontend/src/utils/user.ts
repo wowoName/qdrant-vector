@@ -1,44 +1,109 @@
 /**
- * 用户标识管理 - 匿名用户 ID
+ * 用户认证状态管理 - JWT Token
  *
- * 基于 localStorage 存储匿名用户 ID，用于区分不同用户的会话。
- * 不依赖后端用户系统，纯前端生成。
+ * 基于 localStorage 存储 JWT token 和当前用户信息。
  */
 
-const USER_ID_KEY = 'vdm_user_id'
+const TOKEN_KEY = 'vdm_token'
+const USER_KEY = 'vdm_user'
 
-/**
- * 获取当前用户 ID（如果没有则生成一个）
- */
-export function getUserId(): string {
-  let userId = localStorage.getItem(USER_ID_KEY)
-  if (!userId) {
-    userId = generateUserId()
-    localStorage.setItem(USER_ID_KEY, userId)
+export interface UserInfo {
+  id: string
+  email: string
+  nickname: string | null
+  role: 'super_admin' | 'tenant_admin' | 'user'
+  owner_admin_id: string | null
+  status: string
+  is_verified: boolean
+  created_at: string | null
+  expires_at: string | null
+  last_login_at: string | null
+}
+
+/** 获取 token */
+export function getToken(): string {
+  return localStorage.getItem(TOKEN_KEY) || ''
+}
+
+/** 获取当前用户信息 */
+export function getUser(): UserInfo | null {
+  const raw = localStorage.getItem(USER_KEY)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as UserInfo
+  } catch {
+    return null
   }
-  return userId
 }
 
-/**
- * 生成用户 ID
- * 格式：anon_ + 随机字符串（16 位十六进制）
- */
-function generateUserId(): string {
-  const chars = 'abcdef0123456789'
-  let result = 'anon_'
-  for (let i = 0; i < 16; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length))
-  }
-  return result
+/** 是否已登录 */
+export function isLoggedIn(): boolean {
+  return !!getToken()
 }
 
-/**
- * 重置用户 ID（用于测试或清除）
- */
-export function resetUserId(): string {
-  const newId = generateUserId()
-  localStorage.setItem(USER_ID_KEY, newId)
-  return newId
+/** 是否管理员（总管理员或租户管理员） */
+export function isAdmin(): boolean {
+  const role = getUser()?.role
+  return role === 'super_admin' || role === 'tenant_admin'
 }
 
-export default { getUserId, resetUserId }
+/** 是否总管理员 */
+export function isSuperAdmin(): boolean {
+  return getUser()?.role === 'super_admin'
+}
+
+/** 是否租户管理员 */
+export function isTenantAdmin(): boolean {
+  return getUser()?.role === 'tenant_admin'
+}
+
+/** 角色中文标签 */
+export function roleLabel(): string {
+  const role = getUser()?.role
+  if (role === 'super_admin') return '总管理员'
+  if (role === 'tenant_admin') return '租户管理员'
+  return '普通用户'
+}
+
+/** 是否有写权限（自用号 role=user 对知识库/文档只读） */
+export function canWrite(): boolean {
+  return getUser()?.role !== 'user'
+}
+
+/** 保存登录态 */
+export function setAuth(token: string, user: UserInfo): void {
+  localStorage.setItem(TOKEN_KEY, token)
+  localStorage.setItem(USER_KEY, JSON.stringify(user))
+}
+
+/** 仅刷新用户信息 */
+export function setUser(user: UserInfo): void {
+  localStorage.setItem(USER_KEY, JSON.stringify(user))
+}
+
+/** 清除登录态（退出登录） */
+export function clearAuth(): void {
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(USER_KEY)
+}
+
+/** 获取 Authorization 请求头值 */
+export function authHeader(): Record<string, string> {
+  const token = getToken()
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+export default {
+  getToken,
+  getUser,
+  isLoggedIn,
+  isAdmin,
+  isSuperAdmin,
+  isTenantAdmin,
+  roleLabel,
+  canWrite,
+  setAuth,
+  setUser,
+  clearAuth,
+  authHeader,
+}

@@ -3,30 +3,33 @@
 """
 
 import os
-import json
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List, Optional
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.db.upload import UploadSessionDB
-from app.models.db.document import DocumentDB, DocumentVersionDB
-from app.models.schemas.document import (
-    UploadInitRequest, UploadInitResponse,
-    UploadStatusResponse, UploadCompleteRequest, UploadCompleteResponse,
-)
 from app.core.config import settings
 from app.core.exceptions import (
-    BadRequestError, NotFoundError, FileTooLargeError, UnsupportedFileTypeError,
+    BadRequestError,
+    FileTooLargeError,
+    NotFoundError,
+    UnsupportedFileTypeError,
 )
 from app.core.logging import get_logger
-from app.utils.hash_utils import generate_id, sha256_file
-from app.utils.file_utils import get_file_type, sanitize_filename, is_supported_file
+from app.models.db.document import DocumentDB, DocumentVersionDB
+from app.models.db.upload import UploadSessionDB
+from app.models.schemas.document import (
+    UploadCompleteRequest,
+    UploadCompleteResponse,
+    UploadInitRequest,
+    UploadInitResponse,
+    UploadStatusResponse,
+)
+from app.providers.storage.factory import get_storage
 from app.services.collection_service import CollectionService
 from app.services.document_service import DocumentService
-from app.services.task_service import TaskService, enqueue_task
-from app.providers.storage.factory import get_storage
+from app.utils.file_utils import get_file_type, sanitize_filename
+from app.utils.hash_utils import generate_id, sha256_file
 
 logger = get_logger(__name__)
 
@@ -95,9 +98,7 @@ class UploadService:
             status="uploading",
         )
 
-    async def upload_chunk(
-        self, upload_id: str, chunk_index: int, content: bytes
-    ) -> dict:
+    async def upload_chunk(self, upload_id: str, chunk_index: int, content: bytes) -> dict:
         """上传单个分片"""
         session = await self._get_session(upload_id)
 
@@ -142,6 +143,11 @@ class UploadService:
 
         return {"received": True, "chunk_index": chunk_index, "uploaded_count": len(uploaded)}
 
+    async def get_collection_id(self, upload_id: str) -> str:
+        """获取上传会话对应的 collection_id（供 API 层做归属校验）"""
+        session = await self._get_session(upload_id)
+        return session.collection_id
+
     async def get_status(self, upload_id: str) -> UploadStatusResponse:
         """获取上传状态"""
         session = await self._get_session(upload_id)
@@ -173,9 +179,9 @@ class UploadService:
         return {"cancelled": True, "upload_id": upload_id}
 
     async def complete_upload(
-        self, upload_id: str, req: UploadCompleteRequest
+        self, upload_id: str, req: UploadCompleteRequest, user_id: str | None = None
     ) -> UploadCompleteResponse:
-        """完成上传：合并分片 → 保存 → 触发处理"""
+        """完成上传：合并分片 → 保存 → 触发处理（user_id 用于任务归属）"""
         session = await self._get_session(upload_id)
 
         if session.status != "uploading":
@@ -184,9 +190,7 @@ class UploadService:
         uploaded = list(session.uploaded_chunks or [])
         if len(uploaded) != session.total_chunks:
             missing = [i for i in range(session.total_chunks) if i not in uploaded]
-            raise BadRequestError(
-                f"Missing {len(missing)} chunks: {missing[:5]}..."
-            )
+            raise BadRequestError(f"Missing {len(missing)} chunks: {missing[:5]}...")
 
         # 合并分片
         merged_path = os.path.join(session.temp_dir, "merged.tmp")
@@ -228,6 +232,7 @@ class UploadService:
             file_path=merged_path,
             file_hash=file_hash,  # 已经计算过 hash，直接传入避免重复计算
             directory_id=session.directory_id,
+            user_id=user_id,
         )
 
         # 清理临时文件
@@ -257,15 +262,17 @@ class UploadService:
         collection_id: str,
         file_hash: str,
         filename: str,
-        directory_id: Optional[str],
-    ) -> tuple[Optional[DocumentDB], Optional[DocumentVersionDB]]:
+        directory_id: str | None,
+    ) -> tuple[DocumentDB | None, DocumentVersionDB | None]:
         """按 hash 查找已有文档（秒传）"""
         # 找同 Collection 下相同 hash 的版本
         result = await self.db.execute(
-            select(DocumentVersionDB).where(
+            select(DocumentVersionDB)
+            .where(
                 DocumentVersionDB.file_hash == file_hash,
                 DocumentVersionDB.status == "completed",
-            ).limit(1)
+            )
+            .limit(1)
         )
         version = result.scalar_one_or_none()
         if not version:
@@ -291,6 +298,7 @@ class UploadService:
     def _cleanup_temp(self, temp_dir: str) -> None:
         """清理临时目录"""
         import shutil
+
         try:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)

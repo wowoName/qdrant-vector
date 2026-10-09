@@ -14,11 +14,15 @@
 import json
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sqlalchemy import (
-    Column, String, Integer, BigInteger, Text, DateTime,
-    Index, JSON,
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
 )
 
 from app.core.database import Base
@@ -61,15 +65,15 @@ class DocumentRecordDB(Base):
 
     # 常用业务字段（提取出来建索引，加速结构化查询）
     # 层级字段（销售组织常见）
-    sales_director = Column(String(255), nullable=True, index=True)      # 销售总监
-    region_manager = Column(String(255), nullable=True, index=True)      # 大区/特区经理
-    region = Column(String(255), nullable=True, index=True)              # 大区
-    marketing_company = Column(String(255), nullable=True, index=True)   # 营销公司/特区
-    salesperson = Column(String(255), nullable=True, index=True)         # 业务员
-    customer = Column(String(255), nullable=True, index=True)            # 客商/客户
+    sales_director = Column(String(255), nullable=True, index=True)  # 销售总监
+    region_manager = Column(String(255), nullable=True, index=True)  # 大区/特区经理
+    region = Column(String(255), nullable=True, index=True)  # 大区
+    marketing_company = Column(String(255), nullable=True, index=True)  # 营销公司/特区
+    salesperson = Column(String(255), nullable=True, index=True)  # 业务员
+    customer = Column(String(255), nullable=True, index=True)  # 客商/客户
 
     # 时间字段
-    record_date = Column(String(32), nullable=True, index=True)          # 记录日期
+    record_date = Column(String(32), nullable=True, index=True)  # 记录日期
 
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
@@ -83,7 +87,7 @@ class DocumentRecordDB(Base):
     # 便捷方法
     # ------------------------------------------------------------------
     @property
-    def data(self) -> Dict[str, Any]:
+    def data(self) -> dict[str, Any]:
         """解析 data_json 为 dict"""
         if not self.data_json:
             return {}
@@ -93,12 +97,12 @@ class DocumentRecordDB(Base):
             return {}
 
     @data.setter
-    def data(self, value: Dict[str, Any]):
+    def data(self, value: dict[str, Any]):
         """设置 data（自动序列化 JSON 并提取常用字段）"""
         self.data_json = json.dumps(value, ensure_ascii=False)
         self._extract_common_fields(value)
 
-    def _extract_common_fields(self, data: Dict[str, Any]):
+    def _extract_common_fields(self, data: dict[str, Any]):
         """从 data 中自动提取常用业务字段到索引列"""
         # 销售总监（各种可能的列名）
         self.sales_director = self._pick_field(
@@ -121,16 +125,14 @@ class DocumentRecordDB(Base):
             data, ["业务员", "销售员", "salesperson", "sales_man", "seller"]
         )
         # 客户 / 客商
-        self.customer = self._pick_field(
-            data, ["客商", "客户", "customer", "client", "公司名称"]
-        )
+        self.customer = self._pick_field(data, ["客商", "客户", "customer", "client", "公司名称"])
         # 日期
         self.record_date = self._pick_field(
             data, ["日期", "date", "记录日期", "发货日期", "要货日期"]
         )
 
     @staticmethod
-    def _pick_field(data: Dict[str, Any], candidates: List[str]) -> Optional[str]:
+    def _pick_field(data: dict[str, Any], candidates: list[str]) -> str | None:
         """从多个候选列名中尝试取值"""
         for key in candidates:
             # 精确匹配

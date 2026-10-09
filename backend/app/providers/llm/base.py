@@ -3,7 +3,8 @@ LLM Provider 基类
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 
 class ChatMessage:
@@ -13,7 +14,7 @@ class ChatMessage:
         self.role = role
         self.content = content
 
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> dict[str, str]:
         return {"role": self.role, "content": self.content}
 
 
@@ -24,8 +25,8 @@ class ChatResponse:
         self,
         content: str,
         model: str,
-        usage: Optional[Dict[str, int]] = None,
-        reasoning_content: Optional[str] = None,
+        usage: dict[str, int] | None = None,
+        reasoning_content: str | None = None,
     ):
         self.content = content
         self.model = model
@@ -54,9 +55,9 @@ class BaseLLM(ABC):
     @abstractmethod
     async def chat(
         self,
-        messages: List[ChatMessage],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> ChatResponse:
         """同步聊天（非流式）"""
@@ -65,24 +66,24 @@ class BaseLLM(ABC):
     @abstractmethod
     async def chat_stream(
         self,
-        messages: List[ChatMessage],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
-    ) -> AsyncGenerator[Dict[str, str], None]:
+    ) -> AsyncGenerator[dict[str, str], None]:
         """流式聊天，yield 结构为 {"type": "content"|"reasoning", "content": "..."}"""
         pass
 
     async def simple_chat(
         self,
         prompt: str,
-        system_prompt: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> str:
         """简单单轮对话便捷方法"""
-        messages: List[ChatMessage] = []
+        messages: list[ChatMessage] = []
         if system_prompt:
             messages.append(ChatMessage("system", system_prompt))
         messages.append(ChatMessage("user", prompt))

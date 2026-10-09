@@ -3,17 +3,16 @@ CSV 文档处理器
 专属处理 .csv 文件，解析 + 表格切片一体化。
 """
 
-import asyncio
-import os
-from typing import AsyncGenerator, List
+from collections.abc import AsyncGenerator
+
+from app.chunkers.base import ChunkItem
+from app.chunkers.tabular_chunker import TabularChunker
+from app.core.config import get_tabular_config, settings
+from app.core.logging import get_logger
+from app.parsers.base import ParseResult
+from app.parsers.csv_parser import CSVParser
 
 from .base import BaseDocumentProcessor, ProcessInfo
-from app.parsers.csv_parser import CSVParser
-from app.chunkers.tabular_chunker import TabularChunker
-from app.parsers.base import ParseResult
-from app.chunkers.base import ChunkItem
-from app.core.logging import get_logger
-from app.core.config import settings, get_tabular_config
 
 logger = get_logger(__name__)
 
@@ -34,7 +33,7 @@ class CSVProcessor(BaseDocumentProcessor):
         self._file_type = file_type or "csv"
         self._config_cache: dict | None = None
 
-    def supported_types(self) -> List[str]:
+    def supported_types(self) -> list[str]:
         return ["csv"]
 
     # ------------------------------------------------------------------
@@ -47,13 +46,14 @@ class CSVProcessor(BaseDocumentProcessor):
     # ------------------------------------------------------------------
     # 切片接口
     # ------------------------------------------------------------------
-    async def chunk(self, file_path: str) -> List[ChunkItem]:
+    async def chunk(self, file_path: str) -> list[ChunkItem]:
         """全量切片"""
         chunker = self._get_chunker()
         parse_result = await self.parse(file_path)
 
         if not parse_result.tables or not any(len(t) >= 2 for t in parse_result.tables):
             from app.chunkers.recursive_chunker import RecursiveChunker
+
             fallback = RecursiveChunker()
             return fallback.chunk(parse_result.text)
 
@@ -72,6 +72,7 @@ class CSVProcessor(BaseDocumentProcessor):
 
         if not parse_result.tables or not any(len(t) >= 2 for t in parse_result.tables):
             from app.chunkers.recursive_chunker import RecursiveChunker
+
             fallback = RecursiveChunker()
             for c in fallback.chunk_stream(parse_result.text):
                 yield c

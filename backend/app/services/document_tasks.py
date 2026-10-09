@@ -20,25 +20,25 @@
 
 import os
 import time
-from pathlib import Path
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.db.document import DocumentDB, DocumentVersionDB, ChunkDB
-from app.parsers.factory import parse_file, parse_file_pages, get_total_pages
-from app.chunkers.factory import get_chunker, get_chunker_for_file, TABULAR_FILE_TYPES
+from app.chunkers.factory import TABULAR_FILE_TYPES, get_chunker, get_chunker_for_file
 from app.chunkers.tabular_chunker import TabularChunker
-from app.processors.factory import get_processor, is_supported
+from app.core.config import settings
+from app.core.logging import get_logger
+from app.models.db.document import ChunkDB, DocumentDB, DocumentVersionDB
+from app.parsers.factory import get_total_pages, parse_file, parse_file_pages
 from app.processors.base import BaseDocumentProcessor
+from app.processors.factory import get_processor, is_supported
 from app.providers.embedding.factory import get_embedding
 from app.providers.storage.factory import get_storage
 from app.repositories.qdrant_repo import get_qdrant
 from app.services.task_service import TaskService, register_task
-from app.core.config import settings
-from app.core.logging import get_logger
 from app.utils.hash_utils import sha256_text
-from app.utils.token_utils import count_tokens
 from app.utils.memory_utils import MemoryGuard, get_memory_usage_mb, get_system_memory_info
+from app.utils.token_utils import count_tokens
 
 logger = get_logger(__name__)
 
@@ -81,17 +81,21 @@ def _get_streaming_threshold() -> int:
     """中文件阈值：超过此字符数启用 chunk 级流式"""
     return getattr(settings, "streaming_threshold_chars", 500_000)
 
+
 def _get_page_streaming_threshold_pages() -> int:
     """大文件页数阈值：超过此页数启用页级流式"""
     return getattr(settings, "page_streaming_threshold_pages", 200)
+
 
 def _get_page_streaming_file_size() -> int:
     """大文件大小阈值（字节）：超过此大小启用页级流式，默认 10MB"""
     return getattr(settings, "page_streaming_file_size_mb", 10) * 1024 * 1024
 
+
 def _get_streaming_batch_size() -> int:
     """流式处理每批 chunk 数"""
     return getattr(settings, "streaming_batch_size", 200)
+
 
 def _get_qdrant_batch_size() -> int:
     """Qdrant 每批写入的 point 数"""
@@ -183,6 +187,7 @@ def _is_record_mode(file_type: str, processor: BaseDocumentProcessor | None = No
 
     # 回退：从配置读取
     from app.core.config import get_tabular_config
+
     try:
         cfg = get_tabular_config(file_type)
         return cfg.get("mode", "record") == "record"
@@ -206,6 +211,7 @@ async def _import_records_for_document(
     """
     try:
         from app.services.document_record_service import DocumentRecordService
+
         record_svc = DocumentRecordService(db=db, collection_id=collection_id)
         total = await record_svc.import_excel(
             file_path=file_path,
@@ -236,9 +242,7 @@ async def process_document_task(payload: dict, task_id: str, task_svc: TaskServi
     storage = get_storage()
 
     # 1. 获取版本信息
-    result = await db.execute(
-        select(DocumentVersionDB).where(DocumentVersionDB.id == version_id)
-    )
+    result = await db.execute(select(DocumentVersionDB).where(DocumentVersionDB.id == version_id))
     version = result.scalar_one_or_none()
     if not version:
         raise ValueError(f"Version not found: {version_id}")
@@ -249,6 +253,7 @@ async def process_document_task(payload: dict, task_id: str, task_svc: TaskServi
     if not file_path:
         data = await storage.download(version.storage_path)
         import tempfile
+
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_type}")
         tmp.write(data)
         tmp.close()
@@ -302,7 +307,7 @@ async def process_document_task(payload: dict, task_id: str, task_svc: TaskServi
             )
 
         logger.info(
-            f"File: {file_type}, size={file_size/1024/1024:.1f}MB, "
+            f"File: {file_type}, size={file_size / 1024 / 1024:.1f}MB, "
             f"pages={total_pages}, mode={'page-streaming' if use_page_streaming else 'decide-after-parse'}"
         )
 
@@ -349,8 +354,7 @@ async def process_document_task(payload: dict, task_id: str, task_svc: TaskServi
             size_class = _get_text_length_class(text_len)
 
             logger.info(
-                f"Parsed document, text length: {text_len} ({size_class}), "
-                f"pages: {page_count}"
+                f"Parsed document, text length: {text_len} ({size_class}), pages: {page_count}"
             )
 
             if text_len == 0:
@@ -543,8 +547,7 @@ async def _process_standard(
     if is_excel:
         t_chunk = time.perf_counter() - t_chunk_start
         avg_chunk_len = (
-            sum(len(c.text) for c in chunk_items) / len(chunk_items)
-            if chunk_items else 0
+            sum(len(c.text) for c in chunk_items) / len(chunk_items) if chunk_items else 0
         )
         logger.info(
             f"[Excel-Perf] [{task_id}] Stage 2 - Chunking done: {t_chunk:.2f}s, "
@@ -556,16 +559,22 @@ async def _process_standard(
         return 0
 
     await task_svc.check_cancelled(task_id)
-    await task_svc.update_progress(task_id, 0.3, {
-        "stage": "embedding",
-        "total": len(chunk_items),
-        "mode": "standard",
-    })
+    await task_svc.update_progress(
+        task_id,
+        0.3,
+        {
+            "stage": "embedding",
+            "total": len(chunk_items),
+            "mode": "standard",
+        },
+    )
 
     # ===== Excel 性能剖析：嵌入阶段计时 =====
     if is_excel:
         t_emb_start = time.perf_counter()
-        logger.info(f"[Excel-Perf] [{task_id}] Stage 3 - Embedding start: {len(chunk_items)} chunks")
+        logger.info(
+            f"[Excel-Perf] [{task_id}] Stage 3 - Embedding start: {len(chunk_items)} chunks"
+        )
     # ==========================================
 
     embedding = await get_embedding()
@@ -583,7 +592,7 @@ async def _process_standard(
         emb_speed = len(chunk_items) / t_emb if t_emb > 0 else 0
         logger.info(
             f"[Excel-Perf] [{task_id}] Stage 3 - Embedding done: {t_emb:.2f}s, "
-            f"speed={emb_speed:.1f} chunks/s, avg_len={sum(len(t) for t in texts)/len(texts) if texts else 0:.0f} chars"
+            f"speed={emb_speed:.1f} chunks/s, avg_len={sum(len(t) for t in texts) / len(texts) if texts else 0:.0f} chars"
         )
     # ==========================================
 
@@ -628,9 +637,7 @@ async def _process_standard(
     await task_svc.check_cancelled(task_id)
     await task_svc.update_progress(task_id, 0.85, {"stage": "writing_qdrant"})
 
-    result = await db.execute(
-        select(DocumentDB).where(DocumentDB.id == document_id)
-    )
+    result = await db.execute(select(DocumentDB).where(DocumentDB.id == document_id))
     doc = result.scalar_one()
 
     points = _build_qdrant_points(
@@ -696,9 +703,7 @@ async def _process_chunk_streaming(
     embedding = await get_embedding()
     timer.record("setup")
 
-    result = await db.execute(
-        select(DocumentDB).where(DocumentDB.id == document_id)
-    )
+    result = await db.execute(select(DocumentDB).where(DocumentDB.id == document_id))
     doc = result.scalar_one()
 
     # ---- 优先使用 processor 流式切片 ----
@@ -710,8 +715,7 @@ async def _process_chunk_streaming(
         chunk_iter = processor.chunk_stream(file_path)
         is_async_iter = True
         logger.info(
-            f"Using {type(processor).__name__} streaming, "
-            f"estimated ~{est_total_chunks} chunks"
+            f"Using {type(processor).__name__} streaming, estimated ~{est_total_chunks} chunks"
         )
     else:
         # ---- 回退：旧的方式 ----
@@ -846,15 +850,19 @@ async def _process_chunk_streaming(
             # 计算速度（chunks/秒）
             speed = processed / batch_time if batch_time > 0 else 0
 
-            await task_svc.update_progress(task_id, progress, {
-                "stage": "embedding",
-                "processed": chunk_count,
-                "estimated_total": est_total_chunks,
-                "batch": batch_index,
-                "batch_size": mem_guard.current_batch_size,
-                "speed_chunks_s": round(speed, 1),
-                "memory_mb": round(get_memory_usage_mb(), 1),
-            })
+            await task_svc.update_progress(
+                task_id,
+                progress,
+                {
+                    "stage": "embedding",
+                    "processed": chunk_count,
+                    "estimated_total": est_total_chunks,
+                    "batch": batch_index,
+                    "batch_size": mem_guard.current_batch_size,
+                    "speed_chunks_s": round(speed, 1),
+                    "memory_mb": round(get_memory_usage_mb(), 1),
+                },
+            )
 
             # 每 10 批打一条详细日志（Excel 文件）
             if is_excel and (batch_index % 10 == 0 or batch_index == 0):
@@ -920,22 +928,26 @@ async def _process_chunk_streaming(
             f"[Excel-Perf] [{task_id}] Stage 2-5 - Chunk streaming summary: "
             f"total={t_total:.2f}s, chunks={chunk_count}, batches={batch_index + 1}\n"
             f"  - Chunk generation: {total_chunk_gen_time:.2f}s "
-            f"({total_chunk_gen_time/t_total*100:.1f}%)\n"
+            f"({total_chunk_gen_time / t_total * 100:.1f}%)\n"
             f"  - Embedding: {total_embedding_time:.2f}s "
-            f"({total_embedding_time/t_total*100:.1f}%), "
-            f"speed={chunk_count/total_embedding_time if total_embedding_time > 0 else 0:.1f} chunks/s\n"
+            f"({total_embedding_time / t_total * 100:.1f}%), "
+            f"speed={chunk_count / total_embedding_time if total_embedding_time > 0 else 0:.1f} chunks/s\n"
             f"  - DB save: {total_db_time:.2f}s "
-            f"({total_db_time/t_total*100:.1f}%)\n"
+            f"({total_db_time / t_total * 100:.1f}%)\n"
             f"  - Qdrant write: {total_qdrant_time:.2f}s "
-            f"({total_qdrant_time/t_total*100:.1f}%), "
-            f"speed={chunk_count/total_qdrant_time if total_qdrant_time > 0 else 0:.1f} points/s"
+            f"({total_qdrant_time / t_total * 100:.1f}%), "
+            f"speed={chunk_count / total_qdrant_time if total_qdrant_time > 0 else 0:.1f} points/s"
         )
     # ==========================================
 
-    await task_svc.update_progress(task_id, 0.85, {
-        "stage": "finalizing",
-        "total": chunk_count,
-    })
+    await task_svc.update_progress(
+        task_id,
+        0.85,
+        {
+            "stage": "finalizing",
+            "total": chunk_count,
+        },
+    )
 
     logger.info(f"Chunk streaming complete: {chunk_count} chunks in {batch_index + 1} batches")
     logger.info(timer.summary())
@@ -972,9 +984,7 @@ async def _process_page_streaming(
     """
     embedding = await get_embedding()
 
-    result = await db.execute(
-        select(DocumentDB).where(DocumentDB.id == document_id)
-    )
+    result = await db.execute(select(DocumentDB).where(DocumentDB.id == document_id))
     doc = result.scalar_one()
 
     # 内存卫士
@@ -1030,8 +1040,7 @@ async def _process_page_streaming(
             total_chunk_gen = 0.0
             _last_chunk_time = time.perf_counter()
             logger.info(
-                f"[Excel-Perf] [{task_id}] Page-streaming mode start, "
-                f"estimated ~{est_total} chunks"
+                f"[Excel-Perf] [{task_id}] Page-streaming mode start, estimated ~{est_total} chunks"
             )
         # ==========================================
 
@@ -1082,18 +1091,24 @@ async def _process_page_streaming(
                 ratio = min(1.0, chunk_count / max(est_total, chunk_count))
                 progress = prog_start + ratio * (prog_end - prog_start)
                 progress = min(prog_end, progress)
-                await task_svc.update_progress(task_id, progress, {
-                    "stage": f"processing_{file_type}",
-                    "chunks": chunk_count,
-                    "estimated_total": est_total,
-                    "processor": type(processor).__name__,
-                    "batch_size": mem_guard.current_batch_size,
-                    "memory_mb": round(get_memory_usage_mb(), 1),
-                })
+                await task_svc.update_progress(
+                    task_id,
+                    progress,
+                    {
+                        "stage": f"processing_{file_type}",
+                        "chunks": chunk_count,
+                        "estimated_total": est_total,
+                        "processor": type(processor).__name__,
+                        "batch_size": mem_guard.current_batch_size,
+                        "memory_mb": round(get_memory_usage_mb(), 1),
+                    },
+                )
 
                 # 每 10 批打一条详细日志
                 if is_excel and batch_index % 10 == 0:
-                    batch_time = batch_result.get("total_time", 0) if isinstance(batch_result, dict) else 0
+                    batch_time = (
+                        batch_result.get("total_time", 0) if isinstance(batch_result, dict) else 0
+                    )
                     speed = (batch_result.get("count", 0) / batch_time) if batch_time > 0 else 0
                     logger.info(
                         f"[Excel-Perf] [{task_id}] Page-stream batch {batch_index}: "
@@ -1143,15 +1158,15 @@ async def _process_page_streaming(
                 f"[Excel-Perf] [{task_id}] Page-streaming summary: "
                 f"total={t_total:.2f}s, chunks={chunk_count}, batches={batch_index + 1}\n"
                 f"  - Chunk generation: {total_chunk_gen:.2f}s "
-                f"({total_chunk_gen/t_total*100:.1f}%)\n"
+                f"({total_chunk_gen / t_total * 100:.1f}%)\n"
                 f"  - Embedding: {total_emb:.2f}s "
-                f"({total_emb/t_total*100:.1f}%), "
-                f"speed={chunk_count/total_emb if total_emb > 0 else 0:.1f} chunks/s\n"
+                f"({total_emb / t_total * 100:.1f}%), "
+                f"speed={chunk_count / total_emb if total_emb > 0 else 0:.1f} chunks/s\n"
                 f"  - DB save: {total_db:.2f}s "
-                f"({total_db/t_total*100:.1f}%)\n"
+                f"({total_db / t_total * 100:.1f}%)\n"
                 f"  - Qdrant write: {total_qdrant:.2f}s "
-                f"({total_qdrant/t_total*100:.1f}%), "
-                f"speed={chunk_count/total_qdrant if total_qdrant > 0 else 0:.1f} points/s"
+                f"({total_qdrant / t_total * 100:.1f}%), "
+                f"speed={chunk_count / total_qdrant if total_qdrant > 0 else 0:.1f} points/s"
             )
         # ==========================================
 
@@ -1219,14 +1234,18 @@ async def _process_page_streaming(
             progress = prog_start + (pages_processed / total_pages) * (prog_end - prog_start) * 0.8
             # 加上嵌入和写入的进度修正
             progress = min(prog_end, progress)
-            await task_svc.update_progress(task_id, progress, {
-                "stage": "processing_pages",
-                "page": pages_processed,
-                "total_pages": total_pages,
-                "chunks": chunk_count,
-                "batch_size": mem_guard.current_batch_size,
-                "memory_mb": round(get_memory_usage_mb(), 1),
-            })
+            await task_svc.update_progress(
+                task_id,
+                progress,
+                {
+                    "stage": "processing_pages",
+                    "page": pages_processed,
+                    "total_pages": total_pages,
+                    "chunks": chunk_count,
+                    "batch_size": mem_guard.current_batch_size,
+                    "memory_mb": round(get_memory_usage_mb(), 1),
+                },
+            )
 
     # 处理最后一批
     if batch_chunks:
@@ -1341,11 +1360,11 @@ async def _process_one_batch(
     total = time.perf_counter() - t0
     logger.debug(
         f"[Batch#{batch_index}] {batch_size} chunks done in {total:.2f}s | "
-        f"embedding: {t_emb:.2f}s ({t_emb/total*100:.0f}%), "
-        f"db: {t_db:.2f}s ({t_db/total*100:.0f}%), "
-        f"qdrant: {t_qdrant:.2f}s ({t_qdrant/total*100:.0f}%) | "
+        f"embedding: {t_emb:.2f}s ({t_emb / total * 100:.0f}%), "
+        f"db: {t_db:.2f}s ({t_db / total * 100:.0f}%), "
+        f"qdrant: {t_qdrant:.2f}s ({t_qdrant / total * 100:.0f}%) | "
         f"avg_text_len: {avg_text_len:.0f} chars, "
-        f"speed: {batch_size/total:.1f} chunks/s"
+        f"speed: {batch_size / total:.1f} chunks/s"
     )
 
     if return_timings:
@@ -1395,11 +1414,13 @@ def _build_qdrant_points(
             "parent_text": chunk.parent_text or "",
             "parent_index": chunk.parent_index if chunk.parent_index is not None else -1,
         }
-        points.append({
-            "id": chunk_id,
-            "vector": vectors[i],
-            "payload": payload,
-        })
+        points.append(
+            {
+                "id": chunk_id,
+                "vector": vectors[i],
+                "payload": payload,
+            }
+        )
     return points
 
 
@@ -1421,9 +1442,7 @@ async def _finalize_document(
 
     await db.flush()
 
-    doc_result = await db.execute(
-        select(DocumentDB).where(DocumentDB.id == document_id)
-    )
+    doc_result = await db.execute(select(DocumentDB).where(DocumentDB.id == document_id))
     doc = doc_result.scalar_one()
 
     old_version_id = doc.current_version_id
@@ -1442,9 +1461,8 @@ async def _finalize_document(
             logger.warning(f"Failed to delete old version vectors: {e}")
 
     from app.models.db.collection import CollectionDB
-    coll_result = await db.execute(
-        select(CollectionDB).where(CollectionDB.id == collection_id)
-    )
+
+    coll_result = await db.execute(select(CollectionDB).where(CollectionDB.id == collection_id))
     coll = coll_result.scalar_one_or_none()
     if coll:
         coll.chunk_count = coll.chunk_count + chunk_count
@@ -1469,8 +1487,8 @@ async def _ensure_collection_dimension(
     触发场景：切换 embedding 模型后，旧 Collection 仍是旧维度，
     写入新向量时会报 dimension error。
     """
-    from app.providers.embedding.factory import get_embedding
     from app.models.db.collection import CollectionDB
+    from app.providers.embedding.factory import get_embedding
 
     # 获取当前 embedding 模型的维度
     embedding = await get_embedding()
@@ -1498,9 +1516,7 @@ async def _ensure_collection_dimension(
     )
 
     # 从 DB 读取 collection 配置（距离度量等）
-    coll_result = await db.execute(
-        select(CollectionDB).where(CollectionDB.id == collection_id)
-    )
+    coll_result = await db.execute(select(CollectionDB).where(CollectionDB.id == collection_id))
     coll = coll_result.scalar_one_or_none()
     distance = coll.distance_metric if coll else "cosine"
 
@@ -1560,9 +1576,8 @@ async def _cleanup_cancelled_task(
     # 2. 清理 chunks 表
     try:
         from sqlalchemy import delete
-        result = await db.execute(
-            delete(ChunkDB).where(ChunkDB.version_id == version_id)
-        )
+
+        result = await db.execute(delete(ChunkDB).where(ChunkDB.version_id == version_id))
         chunk_deleted = result.rowcount or 0
         await db.commit()
         logger.info(f"[Cleanup] Deleted {chunk_deleted} chunks from DB")
@@ -1575,12 +1590,12 @@ async def _cleanup_cancelled_task(
 
     # 3. 清理 document_records 表（Record 模式）
     try:
-        from app.models.db.document_record import DocumentRecordDB
         from sqlalchemy import delete as sql_delete
+
+        from app.models.db.document_record import DocumentRecordDB
+
         result = await db.execute(
-            sql_delete(DocumentRecordDB).where(
-                DocumentRecordDB.version_id == version_id
-            )
+            sql_delete(DocumentRecordDB).where(DocumentRecordDB.version_id == version_id)
         )
         record_deleted = result.rowcount or 0
         await db.commit()

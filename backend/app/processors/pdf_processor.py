@@ -4,16 +4,15 @@ PDF 文档处理器
 支持逐页流式处理，大文件内存占用低。
 """
 
-import asyncio
-from typing import List, AsyncIterator
+from collections.abc import AsyncIterator
+
+from app.chunkers.base import ChunkItem
+from app.core.config import get_chunk_config, settings
+from app.core.logging import get_logger
+from app.parsers.base import ParseResult
+from app.parsers.pdf_parser import PDFParser
 
 from .base import BaseDocumentProcessor, ProcessInfo
-from app.parsers.pdf_parser import PDFParser
-from app.chunkers.recursive_chunker import RecursiveChunker
-from app.parsers.base import ParseResult, PageParseResult
-from app.chunkers.base import ChunkItem
-from app.core.logging import get_logger
-from app.core.config import settings, get_chunk_config
 
 logger = get_logger(__name__)
 
@@ -35,7 +34,7 @@ class PDFProcessor(BaseDocumentProcessor):
         self._chunk_strategy_override = chunk_strategy
         self._config_cache: dict | None = None
 
-    def supported_types(self) -> List[str]:
+    def supported_types(self) -> list[str]:
         return ["pdf"]
 
     # ------------------------------------------------------------------
@@ -48,7 +47,7 @@ class PDFProcessor(BaseDocumentProcessor):
     # ------------------------------------------------------------------
     # 切片接口
     # ------------------------------------------------------------------
-    async def chunk(self, file_path: str) -> List[ChunkItem]:
+    async def chunk(self, file_path: str) -> list[ChunkItem]:
         """全量切片"""
         chunker = self._get_chunker()
         parse_result = await self.parse(file_path)

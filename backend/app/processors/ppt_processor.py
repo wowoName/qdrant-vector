@@ -2,8 +2,6 @@
 PPT 文档处理器（PPT / PPTX）
 """
 
-from typing import List
-
 from .text_processor import TextDocumentProcessor
 
 
@@ -12,7 +10,8 @@ class PPTProcessor(TextDocumentProcessor):
 
     def _create_parser(self):
         from app.parsers.ppt_parser import PPTParser
+
         return PPTParser()
 
-    def supported_types(self) -> List[str]:
+    def supported_types(self) -> list[str]:
         return ["pptx", "ppt", "powerpoint"]

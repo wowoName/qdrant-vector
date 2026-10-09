@@ -48,28 +48,38 @@ class TaskService:
         task_type: str,
         payload: dict,
         priority: int = 5,
+        user_id: str | None = None,
     ) -> TaskDB:
-        """创建任务"""
+        """创建任务（user_id 为任务归属用户，用于 SaaS 隔离）"""
         task = TaskDB(
             id=generate_id(),
             type=task_type,
             status="pending",
             priority=priority,
             payload=payload,
+            user_id=user_id,
             max_retries=settings.task_max_retries,
         )
         self.db.add(task)
         await self.db.flush()
         await self.db.commit()
         await self.db.refresh(task)
-        logger.info(f"Task created: {task.id} ({task_type})")
+        logger.info(f"Task created: {task.id} ({task_type}, user={user_id})")
         return task
 
-    async def get_task(self, task_id: str) -> TaskDB:
-        """获取任务详情"""
+    async def get_task(self, task_id: str, user_id: str | None = None) -> TaskDB:
+        """获取任务详情
+
+        user_id 不为 None 时校验任务归属（API 层使用，防止跨用户访问）。
+        内部调用（run_task/update_progress 等）不传 user_id，不做归属校验。
+        """
         result = await self.db.execute(select(TaskDB).where(TaskDB.id == task_id))
         task = result.scalar_one_or_none()
         if not task:
+            from app.core.exceptions import TaskNotFoundError
+
+            raise TaskNotFoundError(task_id)
+        if user_id is not None and task.user_id != user_id:
             from app.core.exceptions import TaskNotFoundError
 
             raise TaskNotFoundError(task_id)
@@ -81,10 +91,13 @@ class TaskService:
         page_size: int = 20,
         task_type: str | None = None,
         status: str | None = None,
+        user_id: str | None = None,
     ) -> tuple[list[TaskDB], int]:
-        """任务列表"""
+        """任务列表（user_id 不为 None 时只返回该用户的任务）"""
         query = select(TaskDB)
 
+        if user_id is not None:
+            query = query.where(TaskDB.user_id == user_id)
         if task_type:
             query = query.where(TaskDB.type == task_type)
         if status:
@@ -182,6 +195,7 @@ class TaskService:
             # 先检查是否是被取消的
             try:
                 from sqlalchemy import text
+
                 row = await self.db.execute(
                     text("SELECT status FROM tasks WHERE id = :tid"),
                     {"tid": task_id},
@@ -258,9 +272,9 @@ class TaskService:
         except Exception as e:
             logger.error(f"Failed to requeue task {task_id}: {e}")
 
-    async def cancel_task(self, task_id: str) -> None:
-        """取消任务"""
-        task = await self.get_task(task_id)
+    async def cancel_task(self, task_id: str, user_id: str | None = None) -> None:
+        """取消任务（user_id 不为 None 时校验任务归属）"""
+        task = await self.get_task(task_id, user_id=user_id)
         if task.status in ("running", "pending", "queued"):
             task.status = "cancelled"
             task.completed_at = datetime.utcnow()
@@ -270,6 +284,7 @@ class TaskService:
             logger.info(f"Task cancelled: {task_id}")
         else:
             from app.core.exceptions import BadRequestError
+
             raise BadRequestError(f"Cannot cancel task with status: {task.status}")
 
     async def is_task_cancelled(self, task_id: str) -> bool:
@@ -288,6 +303,7 @@ class TaskService:
 
         # 缓存未命中或已过期，查 DB
         from sqlalchemy import text
+
         try:
             row = await self.db.execute(
                 text("SELECT status FROM tasks WHERE id = :tid"),

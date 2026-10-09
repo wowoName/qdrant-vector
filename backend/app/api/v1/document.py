@@ -1,5 +1,5 @@
 """
-Document API
+Document API（SaaS：按登录用户/管理员可见范围隔离）
 """
 
 import mimetypes
@@ -11,16 +11,25 @@ from fastapi.responses import StreamingResponse, FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
-from app.api.deps import get_db
+from app.api.deps import get_db, get_visible_ids, require_writer
+from app.models.db.user import UserDB
 from app.models.schemas.document import (
     DocumentResponse, DocumentVersionResponse, ChunkResponse, SimpleUploadResponse,
 )
 from app.models.schemas.common import success, paginated
 from app.services.document_service import DocumentService
+from app.services.collection_service import CollectionService
 from app.providers.storage.factory import get_storage
 from app.core.exceptions import DocumentNotFoundError
 
 router = APIRouter(tags=["Documents"])
+
+
+async def _ensure_collection_access(
+    db: AsyncSession, collection_id: str, visible_ids: list[str]
+) -> None:
+    """校验 collection 在当前用户可见范围内，否则按不存在处理"""
+    await CollectionService(db).get_by_id(collection_id, visible_ids=visible_ids)
 
 
 @router.get("/collections/{collection_id}/documents", summary="获取文档列表")
@@ -32,7 +41,9 @@ async def list_documents(
     keyword: str = Query(None),
     file_type: str = Query(None),
     db: AsyncSession = Depends(get_db),
+    visible_ids: list[str] = Depends(get_visible_ids),
 ):
+    await _ensure_collection_access(db, collection_id, visible_ids)
     service = DocumentService(db)
     items, total = await service.list_documents(
         collection_id=collection_id,
@@ -56,7 +67,10 @@ async def upload_document(
     file: UploadFile = File(...),
     directory_id: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
+    user: UserDB = Depends(require_writer),
+    visible_ids: list[str] = Depends(get_visible_ids),
 ):
+    await _ensure_collection_access(db, collection_id, visible_ids)
     content = await file.read()
     service = DocumentService(db)
     result = await service.upload_file(
@@ -64,17 +78,26 @@ async def upload_document(
         filename=file.filename or "unnamed",
         content=content,
         directory_id=directory_id,
+        user_id=user.id,
     )
     return success(result.model_dump())
+
+
+async def _get_owned_document(db: AsyncSession, document_id: str, visible_ids: list[str]):
+    """获取文档并校验其所属 collection 在可见范围内"""
+    service = DocumentService(db)
+    doc = await service.get_document(document_id)
+    await _ensure_collection_access(db, doc.collection_id, visible_ids)
+    return doc
 
 
 @router.get("/documents/{document_id}", summary="获取文档详情")
 async def get_document(
     document_id: str,
     db: AsyncSession = Depends(get_db),
+    visible_ids: list[str] = Depends(get_visible_ids),
 ):
-    service = DocumentService(db)
-    doc = await service.get_document(document_id)
+    doc = await _get_owned_document(db, document_id, visible_ids)
     return success(DocumentResponse.model_validate(doc).model_dump())
 
 
@@ -82,7 +105,10 @@ async def get_document(
 async def delete_document(
     document_id: str,
     db: AsyncSession = Depends(get_db),
+    user: UserDB = Depends(require_writer),
+    visible_ids: list[str] = Depends(get_visible_ids),
 ):
+    await _get_owned_document(db, document_id, visible_ids)
     service = DocumentService(db)
     await service.delete_document(document_id)
     return success(message="Document deleted")
@@ -92,7 +118,9 @@ async def delete_document(
 async def get_document_versions(
     document_id: str,
     db: AsyncSession = Depends(get_db),
+    visible_ids: list[str] = Depends(get_visible_ids),
 ):
+    await _get_owned_document(db, document_id, visible_ids)
     service = DocumentService(db)
     versions = await service.get_versions(document_id)
     return success([DocumentVersionResponse.model_validate(v).model_dump() for v in versions])
@@ -104,7 +132,21 @@ async def get_version_chunks(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    visible_ids: list[str] = Depends(get_visible_ids),
 ):
+    # 通过 version 反查文档归属校验
+    from sqlalchemy import select
+
+    from app.models.db.document import DocumentVersionDB
+
+    result = await db.execute(
+        select(DocumentVersionDB.document_id).where(DocumentVersionDB.id == version_id)
+    )
+    document_id = result.scalar_one_or_none()
+    if not document_id:
+        raise DocumentNotFoundError(version_id)
+    await _get_owned_document(db, document_id, visible_ids)
+
     service = DocumentService(db)
     chunks, total = await service.get_chunks(version_id, page, page_size)
     return paginated(
@@ -119,9 +161,12 @@ async def get_version_chunks(
 async def reindex_document(
     document_id: str,
     db: AsyncSession = Depends(get_db),
+    user: UserDB = Depends(require_writer),
+    visible_ids: list[str] = Depends(get_visible_ids),
 ):
+    await _get_owned_document(db, document_id, visible_ids)
     service = DocumentService(db)
-    task_id = await service.reindex(document_id)
+    task_id = await service.reindex(document_id, user_id=user.id)
     return success({"task_id": task_id})
 
 
@@ -132,11 +177,12 @@ async def download_document(
     filename: Optional[str] = None,
     preview: bool = Query(False, description="是否以内联方式预览（在浏览器中打开）"),
     db: AsyncSession = Depends(get_db),
+    visible_ids: list[str] = Depends(get_visible_ids),
 ):
     """下载或预览文档文件"""
     service = DocumentService(db)
     try:
-        doc = await service.get_document(document_id)
+        doc = await _get_owned_document(db, document_id, visible_ids)
     except DocumentNotFoundError:
         raise HTTPException(status_code=404, detail="Document not found")
 

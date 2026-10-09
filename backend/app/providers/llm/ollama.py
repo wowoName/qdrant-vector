@@ -4,8 +4,6 @@ Ollama LLM 实现（本地运行）
 Ollama 提供 OpenAI 兼容接口：http://localhost:11434/v1
 """
 
-from typing import Optional
-
 from .openai_compatible import OpenAICompatibleLLM
 
 

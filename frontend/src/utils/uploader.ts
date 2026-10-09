@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { getUserId } from './user'
+import { authHeader } from './user'
 
 // 创建上传专用的 axios 实例，避免全局 60s 超时限制
 const uploadRequest = axios.create({
@@ -10,10 +10,7 @@ const uploadRequest = axios.create({
 // 请求拦截器（与全局保持一致）
 uploadRequest.interceptors.request.use(
   (config) => {
-    const userId = getUserId()
-    if (userId) {
-      config.headers['X-User-ID'] = userId
-    }
+    Object.assign(config.headers, authHeader())
     return config
   },
   (error) => Promise.reject(error)

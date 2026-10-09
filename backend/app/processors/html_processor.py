@@ -2,8 +2,6 @@
 HTML 文档处理器
 """
 
-from typing import List
-
 from .text_processor import TextDocumentProcessor
 
 
@@ -12,7 +10,8 @@ class HTMLProcessor(TextDocumentProcessor):
 
     def _create_parser(self):
         from app.parsers.html_parser import HTMLParser
+
         return HTMLParser()
 
-    def supported_types(self) -> List[str]:
+    def supported_types(self) -> list[str]:
         return ["html", "htm"]

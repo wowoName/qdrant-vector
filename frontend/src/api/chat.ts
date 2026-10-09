@@ -1,5 +1,5 @@
 import request from '@/utils/request'
-import { getUserId } from '@/utils/user'
+import { authHeader } from '@/utils/user'
 
 // Chat API
 
@@ -79,7 +79,7 @@ export async function chatStreamGlobal(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-User-ID': getUserId(),
+      ...authHeader(),
     },
     body: JSON.stringify(data),
     signal,
@@ -204,7 +204,7 @@ export async function chatStream(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-User-ID': getUserId(),
+      ...authHeader(),
     },
     body: JSON.stringify(data),
     signal,

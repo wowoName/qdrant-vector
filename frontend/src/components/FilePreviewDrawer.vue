@@ -69,6 +69,7 @@ import {
 } from '@element-plus/icons-vue'
 import { FilePreviewEmbed } from '@eternalheart/vue-file-preview'
 import '@eternalheart/vue-file-preview/style.css'
+import { getToken } from '@/utils/user'
 
 interface FileInfo {
   id: string
@@ -102,16 +103,19 @@ const canPreview = computed(() => {
   return !unsupportedTypes.includes(type) && !unsupportedTypes.includes(ext)
 })
 
+// 新窗口打开/下载时浏览器不会携带 Authorization 头，改用 ?token= 传递 JWT
+const authQuery = computed(() => `token=${encodeURIComponent(getToken())}`)
+
 const downloadUrl = computed(() => {
   if (!props.fileInfo) return ''
-  return `/api/v1/documents/${props.fileInfo.id}/download`
+  return `/api/v1/documents/${props.fileInfo.id}/download?${authQuery.value}`
 })
 
 const previewUrl = computed(() => {
   if (!props.fileInfo) return ''
   // 在 URL 末尾追加编码后的文件名，帮助预览库识别文件类型
   const encodedName = encodeURIComponent(props.fileInfo.name)
-  return `/api/v1/documents/${props.fileInfo.id}/download/${encodedName}?preview=true`
+  return `/api/v1/documents/${props.fileInfo.id}/download/${encodedName}?preview=true&${authQuery.value}`
 })
 
 const mimeTypeMap: Record<string, string> = {
@@ -229,14 +233,8 @@ watch(visible, (val) => {
   z-index: 100;
 }
 
-.file-preview-drawer :deep(.el-drawer__body) {
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  overflow: hidden;
-  position: relative;
-}
+/* 注意：.el-drawer__body 由 Element Plus 渲染且抽屉被 teleport 到 body，
+   scoped 的 :deep() 无法命中，相关样式放在文件末尾的非 scoped <style> 中 */
 
 .file-info-bar {
   display: flex;
@@ -270,8 +268,8 @@ watch(visible, (val) => {
   min-height: 0;
   overflow: hidden;
   position: relative;
-  /* 确保容器有明确的高度，让子元素的 height: 100% 生效 */
-  height: 0;
+  /* 父级 .el-drawer__body 已设为 flex 列，靠 flex:1 撑满剩余高度 */
+  height: 100%;
 }
 
 .preview-content {
@@ -316,5 +314,15 @@ watch(visible, (val) => {
 
 .mt-2 {
   margin-top: 8px;
+}
+</style>
+
+<!-- 非 scoped：抽屉被 teleport 到 body，scoped 的 :deep() 无法命中 Element Plus 渲染的 body -->
+<style>
+.file-preview-drawer .el-drawer__body {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 </style>
