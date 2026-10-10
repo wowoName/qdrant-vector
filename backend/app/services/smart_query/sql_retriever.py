@@ -1,7 +1,7 @@
 """
 SQL 检索器（结构化精确查询）
 
-优先使用 SQLite 的 document_records 表（Record 模式导入的结构化数据），
+优先使用 PostgreSQL 的 document_records 表（Record 模式导入的结构化数据），
 回退到 DuckDB（旧架构，直接查询 Excel 文件）。
 
 返回统一的 RetrievalHit 列表。
@@ -24,6 +24,7 @@ from .types import (
     TableSchema,
 )
 from app.core.logging import get_logger
+from app.core.sql_compat import json_number, json_text, safe_rollback
 
 logger = get_logger(__name__)
 
@@ -42,7 +43,7 @@ class SQLRetriever(BaseRetriever):
 
     def __init__(self, schema_provider: SchemaProvider, db_session=None):
         self.schema_provider = schema_provider
-        self.db = db_session  # SQLAlchemy async session（可选，有则优先用 SQLite）
+        self.db = db_session  # SQLAlchemy async session（可选，有则优先查 document_records）
 
     # 列名安全校验正则（允许中文、英文字母、数字、下划线、全角/半角括号）
     # 最终安全保障是"列名必须在 schema 白名单中"，正则只是二次防护
@@ -64,15 +65,17 @@ class SQLRetriever(BaseRetriever):
         hits: List[RetrievalHit] = []
 
         try:
-            # 优先走 SQLite document_records 表
+            # 优先走 PostgreSQL document_records 表
             if self.db and schema.document_id:
-                hits = await self._retrieve_from_sqlite(plan, schema, top_k)
+                hits = await self._retrieve_from_records(plan, schema, top_k)
             else:
                 # 回退到 DuckDB
                 hits = await self._retrieve_from_duckdb(query, plan, schema, top_k)
 
         except Exception as e:
             logger.error(f"SQL retrieval failed: {e}")
+            # 回滚失败事务，避免污染共用 session 导致其它检索路径级联失败
+            await safe_rollback(self.db)
             # 返回空结果，由 orchestrator 处理失败
 
         elapsed_ms = (time.time() - start) * 1000
@@ -83,12 +86,12 @@ class SQLRetriever(BaseRetriever):
         return hits
 
     # ------------------------------------------------------------------
-    # SQLite 路径（优先，更快更稳定）
+    # document_records 路径（优先，更快更稳定）
     # ------------------------------------------------------------------
-    async def _retrieve_from_sqlite(
+    async def _retrieve_from_records(
         self, plan: QueryPlan, schema: TableSchema, top_k: int
     ) -> List[RetrievalHit]:
-        """从 SQLite 的 document_records 表查询"""
+        """从 PostgreSQL 的 document_records 表查询"""
         from app.models.db.document_record import DocumentRecordDB
 
         hits: List[RetrievalHit] = []
@@ -139,39 +142,39 @@ class SQLRetriever(BaseRetriever):
         op = plan.operation
 
         if op in (QueryOperation.COUNT,):
-            hits = await self._count_sqlite(
+            hits = await self._count_records(
                 plan, target_db_col, conditions, json_filters, schema
             )
 
         elif op in (QueryOperation.LIST, QueryOperation.DETAIL):
-            hits = await self._list_sqlite(
+            hits = await self._list_records(
                 plan, target_db_col, conditions, json_filters, schema, top_k
             )
 
         elif op == QueryOperation.TOP_N:
-            hits = await self._top_n_sqlite(
+            hits = await self._top_n_records(
                 plan, target_db_col, conditions, json_filters, schema, top_k
             )
 
         elif op in (QueryOperation.SUM, QueryOperation.AVG):
-            hits = await self._aggregate_sqlite(
+            hits = await self._aggregate_records(
                 plan, target_db_col, conditions, json_filters, schema
             )
 
         elif op == QueryOperation.GROUP_COUNT:
-            hits = await self._group_count_sqlite(
+            hits = await self._group_count_records(
                 plan, conditions, json_filters, schema, top_k
             )
 
         else:
             # 未知操作，走列表查询兜底
-            hits = await self._list_sqlite(
+            hits = await self._list_records(
                 plan, target_db_col, conditions, json_filters, schema, top_k
             )
 
         return hits
 
-    async def _count_sqlite(
+    async def _count_records(
         self,
         plan: QueryPlan,
         target_db_col: str,
@@ -192,7 +195,7 @@ class SQLRetriever(BaseRetriever):
         for col, val in json_filters.items():
             col_clean = col.strip()
             if col_clean in schema_col_names and self._COL_NAME_SAFE_RE.match(col_clean):
-                json_where_parts.append(f"json_extract(data_json, '$.{col_clean}') = :j_{col_clean}")
+                json_where_parts.append(f"{json_text('data_json', col_clean)} = :j_{col_clean}")
                 json_params[f"j_{col_clean}"] = val
 
         # ---- 根据目标列位置选择查询方式 ----
@@ -216,12 +219,12 @@ class SQLRetriever(BaseRetriever):
                 params = {"doc_id": schema.document_id, **json_params}
                 # 索引列条件（如 sales_director = 'xxx'）也需要加入 WHERE
                 # 从 conditions 中提取（conditions 是 ORM 构建的条件列表）
-                # 简化处理：直接用 ORM + json_extract 组合
+                # 简化处理：直接用 ORM + JSON 取值表达式组合
                 all_conditions = list(conditions)
                 for jw in json_where_parts:
                     all_conditions.append(sa_text(jw))
                 stmt = (
-                    select(func.count(func.distinct(sa_text(f"json_extract(data_json, '$.{target_clean}')"))))
+                    select(func.count(func.distinct(sa_text(json_text('data_json', target_clean)))))
                     .where(and_(*all_conditions))
                 )
                 result = await self.db.execute(stmt, json_params)
@@ -261,7 +264,7 @@ class SQLRetriever(BaseRetriever):
             # 最多返回 50 条明细，足够展示
             list_limit = min(50, max(count_val, 0))
             if list_limit > 0:
-                list_hits = await self._list_sqlite(
+                list_hits = await self._list_records(
                     plan, target_db_col, conditions, json_filters, schema, list_limit
                 )
                 # 给明细 hit 打上标记，表明是 COUNT 查询附带的明细
@@ -270,11 +273,12 @@ class SQLRetriever(BaseRetriever):
                     h.payload["from_count_query"] = True
         except Exception as e:
             logger.warning(f"Failed to get detail list for count query: {e}")
+            await safe_rollback(self.db)
 
         # 第一个是聚合结果，后面是明细
         return [hit] + list_hits
 
-    async def _list_sqlite(
+    async def _list_records(
         self,
         plan: QueryPlan,
         target_db_col: str,
@@ -305,7 +309,7 @@ class SQLRetriever(BaseRetriever):
             col_clean = col.strip()
             if col_clean in schema_col_names and self._COL_NAME_SAFE_RE.match(col_clean):
                 all_conditions.append(
-                    sa_text(f"json_extract(data_json, '$.{col_clean}') = :j_{col_clean}")
+                    sa_text(f"{json_text('data_json', col_clean)} = :j_{col_clean}")
                 )
                 json_params[f"j_{col_clean}"] = val
 
@@ -320,19 +324,19 @@ class SQLRetriever(BaseRetriever):
 
         if has_distinct_target:
             # ---- 模式1：DISTINCT 去重列表（如"有哪些销售经理"） ----
-            hits = await self._distinct_list_sqlite(
+            hits = await self._distinct_list_records(
                 plan, target_db_col, target_col_clean,
                 all_conditions, json_params, schema, top_k
             )
         else:
             # ---- 模式2：完整行列表（如"销售记录列表"） ----
-            hits = await self._full_row_list_sqlite(
+            hits = await self._full_row_list_records(
                 plan, all_conditions, json_params, top_k
             )
 
         return hits
 
-    async def _distinct_list_sqlite(
+    async def _distinct_list_records(
         self, plan, target_db_col, target_col_clean,
         all_conditions, json_params, schema, top_k
     ) -> List[RetrievalHit]:
@@ -363,7 +367,7 @@ class SQLRetriever(BaseRetriever):
                 values = [row[0] for row in result.fetchall() if row[0] is not None]
         else:
             # 目标列在 JSON 中
-            json_col_expr = sa_text(f"json_extract(data_json, '$.{target_col_clean}')")
+            json_col_expr = sa_text(json_text('data_json', target_col_clean))
             # 去重总数
             count_stmt = select(func.count(func.distinct(json_col_expr))).where(and_(*all_conditions))
             total_count = (await self.db.execute(count_stmt, json_params)).scalar() or 0
@@ -417,7 +421,7 @@ class SQLRetriever(BaseRetriever):
 
         return hits
 
-    async def _full_row_list_sqlite(
+    async def _full_row_list_records(
         self, plan, all_conditions, json_params, top_k
     ) -> List[RetrievalHit]:
         """完整行列表查询（无明确目标列时使用）
@@ -436,6 +440,7 @@ class SQLRetriever(BaseRetriever):
             total_count = count_result.scalar() or 0
         except Exception as e:
             logger.warning(f"Failed to count total records for list query: {e}")
+            await safe_rollback(self.db)
 
         # ---- Step 2: 全量查询明细行（不做 LIMIT） ----
         stmt = (
@@ -483,7 +488,7 @@ class SQLRetriever(BaseRetriever):
 
         return hits
 
-    async def _top_n_sqlite(
+    async def _top_n_records(
         self, plan, target_db_col, conditions, json_filters, schema, top_k
     ) -> List[RetrievalHit]:
         """Top N 排名查询
@@ -501,7 +506,7 @@ class SQLRetriever(BaseRetriever):
         for col, val in json_filters.items():
             col_clean = col.strip()
             if col_clean in schema_col_names and self._COL_NAME_SAFE_RE.match(col_clean):
-                json_where_parts.append(f"json_extract(data_json, '$.{col_clean}') = :j_{col_clean}")
+                json_where_parts.append(f"{json_text('data_json', col_clean)} = :j_{col_clean}")
                 json_params[f"j_{col_clean}"] = val
 
         all_conditions = list(conditions)
@@ -537,7 +542,7 @@ class SQLRetriever(BaseRetriever):
                     return self._records_to_hits(records, total_count, "top_n")
             else:
                 # JSON 列排序
-                json_col_expr = sa_text(f"json_extract(data_json, '$.{target_col_clean}') + 0")
+                json_col_expr = sa_text(json_number('data_json', target_col_clean))
                 # 总数
                 count_stmt = select(func.count(DocumentRecordDB.id)).where(and_(*all_conditions))
                 total_count = (await self.db.execute(count_stmt, json_params)).scalar() or 0
@@ -545,7 +550,7 @@ class SQLRetriever(BaseRetriever):
                 stmt = (
                     select(DocumentRecordDB)
                     .where(and_(*all_conditions))
-                    .order_by(sa_text(f"json_extract(data_json, '$.{target_col_clean}') + 0 DESC"))
+                    .order_by(sa_text(f"{json_number('data_json', target_col_clean)} DESC"))
                     .limit(n)
                 )
                 result = await self.db.execute(stmt, json_params)
@@ -588,7 +593,7 @@ class SQLRetriever(BaseRetriever):
             hits.append(hit)
         return hits
 
-    async def _aggregate_sqlite(
+    async def _aggregate_records(
         self, plan, target_db_col, conditions, json_filters, schema
     ) -> List[RetrievalHit]:
         """SUM / AVG 聚合查询（真正的数值聚合）"""
@@ -603,7 +608,7 @@ class SQLRetriever(BaseRetriever):
         for col, val in json_filters.items():
             col_clean = col.strip()
             if col_clean in schema_col_names and self._COL_NAME_SAFE_RE.match(col_clean):
-                json_where_parts.append(f"json_extract(data_json, '$.{col_clean}') = :j_{col_clean}")
+                json_where_parts.append(f"{json_text('data_json', col_clean)} = :j_{col_clean}")
                 json_params[f"j_{col_clean}"] = val
 
         # ---- 构建完整的 WHERE 条件 ----
@@ -636,11 +641,8 @@ class SQLRetriever(BaseRetriever):
         # 策略2：目标列在 JSON 中（常见情况：销售金额等数值列）
         elif target_col_clean and target_col_clean in schema_col_names \
                 and self._COL_NAME_SAFE_RE.match(target_col_clean):
-            # 使用 json_extract 提取数值字段做聚合
-            # CAST 为 REAL 确保数值运算
-            json_col_expr = sa_text(
-                f"CAST(json_extract(data_json, '$.{target_col_clean}') AS REAL)"
-            )
+            # 使用方言化的 JSON 取值表达式提取数值字段做聚合
+            json_col_expr = sa_text(json_number('data_json', target_col_clean))
             if op == QueryOperation.SUM:
                 stmt = select(func.sum(json_col_expr)).where(and_(*all_conditions))
                 result = await self.db.execute(stmt, json_params)
@@ -695,7 +697,7 @@ class SQLRetriever(BaseRetriever):
             # 最多返回 10 条明细（聚合类查询不需要太多明细）
             list_limit = min(10, max(total_count, 0))
             if list_limit > 0:
-                list_hits = await self._list_sqlite(
+                list_hits = await self._list_records(
                     plan, target_db_col, conditions, json_filters, schema, list_limit
                 )
                 for h in list_hits:
@@ -703,15 +705,16 @@ class SQLRetriever(BaseRetriever):
                     h.payload["from_aggregate_query"] = True
         except Exception as e:
             logger.warning(f"Failed to get detail list for aggregate query: {e}")
+            await safe_rollback(self.db)
 
         # 第一个是聚合结果，后面是明细
         return [hit] + list_hits
 
-    async def _group_count_sqlite(
+    async def _group_count_records(
         self, plan, conditions, json_filters, schema, top_k
     ) -> List[RetrievalHit]:
         """分组统计（简化：走列表查询）"""
-        return await self._list_sqlite(
+        return await self._list_records(
             plan, plan.group_by, conditions, json_filters, schema, top_k
         )
 

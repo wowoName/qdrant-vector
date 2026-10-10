@@ -327,8 +327,15 @@ class DocumentService:
             except Exception as e:
                 logger.warning(f"Failed to delete storage file: {e}")
 
-        # 删除数据库记录（级联：chunks, versions, document）
+        # 删除数据库记录（级联：chunks, records, versions, document）
+        from app.models.db.document_record import DocumentRecordDB
+
         await self.db.execute(ChunkDB.__table__.delete().where(ChunkDB.document_id == document_id))
+        await self.db.execute(
+            DocumentRecordDB.__table__.delete().where(
+                DocumentRecordDB.document_id == document_id
+            )
+        )
         await self.db.execute(
             DocumentVersionDB.__table__.delete().where(DocumentVersionDB.document_id == document_id)
         )

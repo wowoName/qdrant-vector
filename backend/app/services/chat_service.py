@@ -12,14 +12,16 @@
 - 命令系统：支持 /** 格式的命令，如 /kb 切换知识库
 """
 
+import asyncio
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import QdrantCollectionNotFoundError, QdrantConnectionError, QdrantError
 from app.core.logging import get_logger
+from app.core.sql_compat import safe_rollback
 from app.models.schemas.chat import (
     ChatMessage as ChatMessageSchema,
 )
@@ -238,14 +240,22 @@ class ChatService:
         # 5. 先尝试 SmartQuery 智能问数（如果启用）
         smart_query_result = None
         if settings.smart_query_enabled:
+            # 统一上下文构建：历史经「压缩 → 蒸馏 → 丢弃」后注入合成阶段
+            smart_history_text = ""
+            if settings.smart_query_use_history and history_msgs:
+                smart_history_text, _ = self.context_mgr.build_history_block(
+                    history_messages=history_msgs,
+                    summaries=summaries,
+                    current_query=req.query,
+                )
             try:
                 smart_query_result = await self._try_smart_query(
                     query=query_for_search,
-                    original_query=req.query,
                     collection_id=effective_collection_id or "all",
                     session_id=session_id,
                     history_msgs=history_msgs,
                     top_k=req.top_k,
+                    history_text=(smart_history_text or None),
                 )
             except Exception as e:
                 logger.warning(f"SmartQuery failed, falling back to regular RAG: {e}")
@@ -309,6 +319,7 @@ class ChatService:
                 await self.compaction_service.maybe_compact(conv.id, session_id, updated_history)
             except Exception as e:
                 logger.warning(f"Compaction after smart query failed (non-critical): {e}")
+                await safe_rollback(self.chat_db)
 
             latency_ms = (time.time() - start_time) * 1000
             return ChatResponse(
@@ -484,6 +495,7 @@ class ChatService:
             await self.compaction_service.maybe_compact(conv.id, session_id, updated_history)
         except Exception as e:
             logger.warning(f"Compaction failed (non-critical): {e}")
+            await safe_rollback(self.chat_db)
 
         latency_ms = (time.time() - start_time) * 1000
 
@@ -551,6 +563,12 @@ class ChatService:
 
             effective_collection_id = req.collection_id or conv.collection_id
 
+            # P0：会话就绪后立刻下发 meta，避免前置阶段（改写/检索）期间前端"黑屏"等待
+            yield {
+                "type": "meta",
+                "session_id": session_id,
+            }
+
             # 3. 加载历史 + 摘要
             history_msgs = await self._load_history(conv.id, session_id)
             history_for_rewrite = (
@@ -565,6 +583,7 @@ class ChatService:
             rewritten_query = None
             # 无论是否指定了知识库，都支持改写
             if req.use_rewrite and history_for_rewrite:
+                yield {"type": "stage", "stage": "rewrite", "status": "start"}
                 try:
                     rewritten_query = await self._rewrite_query(req.query, history_for_rewrite)
                     query_for_search = rewritten_query
@@ -572,22 +591,70 @@ class ChatService:
                 except Exception as e:
                     logger.warning(f"Query rewrite failed: {e}, using original query")
                     query_for_search = req.query
+                yield {"type": "stage", "stage": "rewrite", "status": "done"}
 
             # 5. 先尝试 SmartQuery 智能问数（如果启用）
+            #    P1：合成阶段真流式——后台跑编排，同时把合成产生的 LLM 增量实时透传给前端，
+            #    而不是等整段答案生成完再一次性下发。
             smart_query_result = None
+            sq_text_parts: list[str] = []
+            sq_queue: asyncio.Queue | None = None
+
+            # 统一上下文构建：把历史做「压缩 → 蒸馏 → 丢弃」后渲染成文本块，
+            # 供 SmartQuery 合成阶段注入（与常规 RAG 的 assemble 共用同一套策略，
+            # 保证两条生成路径的上下文行为一致）。
+            smart_history_text = ""
+            if (
+                settings.smart_query_enabled
+                and settings.smart_query_use_history
+                and history_msgs
+            ):
+                smart_history_text, _hist_applied = self.context_mgr.build_history_block(
+                    history_messages=history_msgs,
+                    summaries=summaries,
+                    current_query=req.query,
+                )
+                if smart_history_text:
+                    logger.debug(
+                        f"SmartQuery history injected: chars={len(smart_history_text)}, "
+                        f"strategies={_hist_applied}"
+                    )
+
             if settings.smart_query_enabled:
-                try:
-                    smart_query_result = await self._try_smart_query(
+                yield {"type": "stage", "stage": "route", "status": "start"}
+
+                def _sq_sink(piece: str) -> None:
+                    sq_text_parts.append(piece)
+                    if sq_queue is not None:
+                        sq_queue.put_nowait({"type": "delta", "content": piece})
+
+                if settings.smart_query_stream_synthesis:
+                    sq_queue = asyncio.Queue()
+
+                sq_task = asyncio.create_task(
+                    self._try_smart_query(
                         query=query_for_search,
-                        original_query=req.query,
                         collection_id=effective_collection_id or "all",
                         session_id=session_id,
                         history_msgs=history_msgs,
                         top_k=req.top_k,
+                        delta_sink=(_sq_sink if sq_queue is not None else None),
+                        history_text=(smart_history_text or None),
                     )
+                )
+                try:
+                    if sq_queue is not None:
+                        # 边等边下发增量；空闲时按心跳间隔保活
+                        async for _ev in self._drain_stream(sq_task, sq_queue):
+                            yield _ev
+                    smart_query_result = await sq_task
                 except Exception as e:
                     logger.warning(f"SmartQuery failed (stream), falling back to regular RAG: {e}")
                     smart_query_result = None
+                finally:
+                    if not sq_task.done():
+                        sq_task.cancel()
+                yield {"type": "stage", "stage": "route", "status": "done"}
 
             # 如果 SmartQuery 成功返回了结果，直接流式返回
             if (
@@ -649,8 +716,23 @@ class ChatService:
                     )
                 except Exception as e:
                     logger.warning(f"Compaction after smart query (stream) failed: {e}")
+                    await safe_rollback(self.chat_db)
 
-                # 流式输出（模拟流式，一次性输出完整答案）
+                # 合成阶段的增量已在上面实时下发，这里只补齐剩余部分：
+                # 规则生成的答案（未走 LLM 流式）整体下发；LLM 答案尾部可能还追加了
+                # 明细下载链接等后处理内容，按已流出长度截取尾部增量。
+                _streamed = "".join(sq_text_parts)
+                if not _streamed:
+                    yield {"type": "delta", "content": sq_answer}
+                elif sq_answer.startswith(_streamed):
+                    _tail = sq_answer[len(_streamed):]
+                    if _tail:
+                        yield {"type": "delta", "content": _tail}
+                else:
+                    # 罕见情况（模型输出首尾空白被 strip 等）：以最终答案为准，
+                    # 前端会在 done 事件按 answer 校正展示内容
+                    yield {"type": "delta", "content": sq_answer}
+
                 yield {
                     "type": "metadata",
                     "session_id": session_id,
@@ -659,10 +741,6 @@ class ChatService:
                     "is_command": False,
                     "model": smart_query_result.get("model", "smart-query"),
                     "used_sql": sq_used_sql,
-                }
-                yield {
-                    "type": "content",
-                    "content": sq_answer,
                 }
                 yield {
                     "type": "done",
@@ -675,8 +753,46 @@ class ChatService:
                 }
                 return
 
+            # 兜底：SmartQuery 未被采纳，但合成阶段已经向前端吐过内容。
+            # 此时不能回退重跑 RAG（否则同一段内容会输出两次），以已流出内容收尾。
+            if sq_text_parts:
+                _partial_answer = "".join(sq_text_parts)
+                logger.warning(
+                    "SmartQuery result not adopted but partial stream already sent; "
+                    "finalizing with streamed content"
+                )
+                try:
+                    await self._save_turn(
+                        conv_id=conv.id,
+                        session_id=session_id,
+                        turn_id=current_turn,
+                        user_content=req.query,
+                        assistant_content=_partial_answer,
+                    )
+                except Exception as e:
+                    logger.warning(f"Save partial turn failed (non-critical): {e}")
+                    await safe_rollback(self.chat_db)
+                yield {
+                    "type": "metadata",
+                    "session_id": session_id,
+                    "references": [],
+                    "is_kb_answer": True,
+                    "is_command": False,
+                }
+                yield {
+                    "type": "done",
+                    "answer": _partial_answer,
+                    "reasoning": "",
+                    "latency_ms": round((time.time() - start_time) * 1000, 2),
+                    "model": "smart-query",
+                    "is_kb_answer": True,
+                    "is_command": False,
+                }
+                return
+
             # 6. 向量检索（未指定 collection_id 时搜索所有知识库）
             #    （如果 SmartQuery 已经处理了，不会走到这里）
+            yield {"type": "stage", "stage": "retrieve", "status": "start"}
             search_result = None
             search_collection_id = effective_collection_id or "all"
             # 智能计算 top_k：根据查询类型动态调整
@@ -762,9 +878,15 @@ class ChatService:
             elif not effective_collection_id and not references:
                 logger.info(f"Cross-collection search no results (stream): '{req.query[:50]}...'")
 
+            yield {"type": "stage", "stage": "retrieve", "status": "done"}
+
         except Exception as e:
             # 前置阶段失败（非检索类错误，如 DB 故障等）：以 error 事件返回
             logger.error(f"Chat stream pre-check failed: {e}", exc_info=True)
+            # 以事件形式返回意味着异常不会上抛到依赖层，必须在此回滚两个会话，
+            # 否则会带着失败事务进入 teardown 并抛 PendingRollbackError 掩盖本错误
+            await safe_rollback(self.chat_db)
+            await safe_rollback(self.db)
             error_msg = f"请求处理失败：{str(e)}"
             yield {
                 "type": "error",
@@ -802,6 +924,7 @@ class ChatService:
         reasoning_parts: list[str] = []
         model = ""
 
+        yield {"type": "stage", "stage": "synthesize", "status": "start"}
         try:
             async for chunk in llm.chat_stream(
                 assembly.messages,
@@ -822,6 +945,8 @@ class ChatService:
             yield {"type": "content", "content": error_msg}
             answer_parts = [error_msg]
 
+        yield {"type": "stage", "stage": "synthesize", "status": "done"}
+
         final_answer = "".join(answer_parts)
         final_reasoning = "".join(reasoning_parts)
 
@@ -841,6 +966,7 @@ class ChatService:
             )
         except Exception as e:
             logger.warning(f"Save turn failed (non-critical): {e}")
+            await safe_rollback(self.chat_db)
 
         # 12. 触发压缩
         try:
@@ -865,6 +991,7 @@ class ChatService:
             await self.compaction_service.maybe_compact(conv.id, session_id, updated_history)
         except Exception as e:
             logger.warning(f"Compaction failed (non-critical): {e}")
+            await safe_rollback(self.chat_db)
 
         latency_ms = (time.time() - start_time) * 1000
 
@@ -1121,14 +1248,36 @@ class ChatService:
                 self._smart_query_orchestrator = None
         return self._smart_query_orchestrator
 
+    async def _drain_stream(
+        self,
+        task: "asyncio.Task",
+        queue: "asyncio.Queue",
+    ) -> AsyncGenerator[dict, None]:
+        """在等待后台任务完成的同时，把队列里的增量实时下发。
+
+        队列空闲超过心跳间隔时下发一个 ping 事件，避免前置阶段长时间无数据
+        导致网关/代理判定连接空闲而断开。
+        """
+        heartbeat = max(5, int(getattr(settings, "stream_heartbeat_sec", 12)))
+        while True:
+            if task.done() and queue.empty():
+                return
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=heartbeat)
+            except asyncio.TimeoutError:
+                yield {"type": "ping"}
+                continue
+            yield event
+
     async def _try_smart_query(
         self,
         query: str,
-        original_query: str,
         collection_id: str,
         session_id: str,
         history_msgs: list[dict],
         top_k: int,
+        delta_sink: Callable[[str], None] | None = None,
+        history_text: str | None = None,
     ) -> dict | None:
         """
         尝试使用 SmartQuery 智能问数
@@ -1153,10 +1302,18 @@ class ChatService:
         if orchestrator is None:
             return None
 
+        # 绑定流式增量回调：合成阶段的 LLM 输出实时透传（不改变任何检索逻辑）
+        if delta_sink is not None:
+            orchestrator.synthesizer_agent.set_delta_sink(delta_sink)
+        # 绑定对话历史块：让合成阶段具备多轮上下文（同样不参与检索）
+        if history_text:
+            orchestrator.synthesizer_agent.set_history_text(history_text)
+
         try:
-            # 使用原始问题（改写后的可能丢失实体信息）
+            # 使用（多轮追问时已经历史改写、补全实体的）查询：
+            # 让 RouterAgent 能正确解析实体并生成过滤条件
             result = await orchestrator.query(
-                user_query=original_query,
+                user_query=query,
                 collection_id=collection_id,
                 session_id=session_id,
                 history_messages=history_msgs,
@@ -1217,3 +1374,8 @@ class ChatService:
         except Exception as e:
             logger.warning(f"SmartQuery execution failed: {e}")
             return None
+        finally:
+            if delta_sink is not None:
+                orchestrator.synthesizer_agent.set_delta_sink(None)
+            if history_text:
+                orchestrator.synthesizer_agent.set_history_text(None)

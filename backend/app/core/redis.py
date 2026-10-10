@@ -111,14 +111,21 @@ async def cache_set_session_messages(session_id: str, messages: list, ttl: Optio
 
 
 async def cache_append_session_message(session_id: str, message: dict, ttl: Optional[int] = None) -> None:
-    """追加单条消息到 Redis 缓存（读-改-写，非原子但足够）"""
+    """追加单条消息到 Redis 缓存（读-改-写，非原子但足够）
+
+    重要：仅对"已存在且完整"的缓存做增量追加。
+    如果缓存不存在（Redis 重启 / TTL 过期 / 首次写入），这里**不创建**
+    只含本次消息的残缺列表——否则下次 get_messages 命中残缺缓存后，
+    对话历史会被截断成从本次追加开始的几条，导致上下文丢失。
+    缓存不存在时直接返回，让下次读取回源 DB 并回填完整列表。
+    """
     r = get_redis()
     if r is None:
         return
     try:
         messages = await cache_get_session_messages(session_id)
         if messages is None:
-            messages = []
+            return
         messages.append(message)
         await cache_set_session_messages(session_id, messages, ttl)
     except Exception as e:

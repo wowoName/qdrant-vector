@@ -1,29 +1,22 @@
 """
 数据库迁移脚本 - 处理表结构变更
 
-支持 SQLite 和 PostgreSQL。
-SQLite 不支持完整的 ALTER TABLE，需要通过「重建表 + 数据复制」的方式迁移。
-PostgreSQL 直接用 ALTER TABLE 即可。
+PostgreSQL 专用：表结构变更直接使用 ALTER TABLE。
 
 迁移列表：
 - v1: conversations.collection_id 从 NOT NULL 改为 NULLABLE
+- v2: collections 增加 owner_user_id（SaaS 归属）
+- v3: email_codes 增加 failed_attempts（防暴力破解）
+- v4: 用户角色 admin → super_admin（三级层级）
+- v5: tasks 增加 user_id 并回填归属（SaaS 隔离）
 """
 
 from __future__ import annotations
 
-import os
 from typing import Callable
 
 
 # ---------- 工具函数 ----------
-
-def _is_sqlite(db_url: str) -> bool:
-    return "sqlite" in db_url
-
-
-def _is_postgresql(db_url: str) -> bool:
-    return "postgresql" in db_url or "postgres" in db_url
-
 
 async def _check_column_nullable_async(engine, table_name: str, column_name: str) -> bool:
     """检查某列是否为 nullable（True=可空, False=NOT NULL）
@@ -76,84 +69,12 @@ async def migration_v1_collection_id_nullable(engine, db_url: str) -> bool:
 
     print("[migration v1] Migrating conversations.collection_id to nullable...")
 
-    if _is_postgresql(db_url):
-        # PostgreSQL：直接 ALTER TABLE DROP NOT NULL
-        async with engine.begin() as conn:
-            await conn.exec_driver_sql(
-                "ALTER TABLE conversations ALTER COLUMN collection_id DROP NOT NULL"
-            )
-        print("[migration v1] PostgreSQL ALTER TABLE done.")
-
-    elif _is_sqlite(db_url):
-        # SQLite：重建表方式
-        async with engine.begin() as conn:
-            # 1. 创建新表
-            await conn.exec_driver_sql("""
-                CREATE TABLE conversations_new (
-                    id VARCHAR(36) PRIMARY KEY,
-                    session_id VARCHAR(64) NOT NULL UNIQUE,
-                    collection_id VARCHAR(36),
-                    user_id VARCHAR(64),
-                    title VARCHAR(255),
-                    message_count INTEGER DEFAULT 0,
-                    total_tokens INTEGER DEFAULT 0,
-                    version INTEGER NOT NULL DEFAULT 0,
-                    status VARCHAR(20) DEFAULT 'active',
-                    created_at DATETIME,
-                    updated_at DATETIME
-                )
-            """)
-
-            # 2. 复制数据
-            await conn.exec_driver_sql("""
-                INSERT INTO conversations_new
-                    (id, session_id, collection_id, user_id, title, message_count,
-                     total_tokens, version, status, created_at, updated_at)
-                SELECT id, session_id, collection_id, user_id, title, message_count,
-                       total_tokens, version, status, created_at, updated_at
-                FROM conversations
-            """)
-
-            # 3. 删除旧表
-            await conn.exec_driver_sql("DROP TABLE conversations")
-
-            # 4. 重命名新表
-            await conn.exec_driver_sql(
-                "ALTER TABLE conversations_new RENAME TO conversations"
-            )
-
-            # 5. 重建索引
-            await conn.exec_driver_sql(
-                "CREATE INDEX idx_conversations_session_id ON conversations(session_id)"
-            )
-            await conn.exec_driver_sql(
-                "CREATE INDEX idx_conversations_collection_id ON conversations(collection_id)"
-            )
-            await conn.exec_driver_sql(
-                "CREATE INDEX idx_conversations_user_id ON conversations(user_id)"
-            )
-            await conn.exec_driver_sql(
-                "CREATE INDEX idx_conversations_created_at ON conversations(created_at)"
-            )
-            await conn.exec_driver_sql(
-                "CREATE INDEX idx_conversations_updated_at ON conversations(updated_at)"
-            )
-            await conn.exec_driver_sql(
-                "CREATE INDEX idx_collection_user ON conversations(collection_id, user_id)"
-            )
-
-        print("[migration v1] SQLite table rebuild done.")
-    else:
-        # 未知数据库类型，尝试通用的 ALTER TABLE
-        try:
-            async with engine.begin() as conn:
-                await conn.exec_driver_sql(
-                    "ALTER TABLE conversations ALTER COLUMN collection_id DROP NOT NULL"
-                )
-            print("[migration v1] Generic ALTER TABLE done.")
-        except Exception as e:
-            print(f"[migration v1] Failed with generic ALTER TABLE: {e}")
-            raise
+    # PostgreSQL：直接 ALTER TABLE DROP NOT NULL
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "ALTER TABLE conversations ALTER COLUMN collection_id DROP NOT NULL"
+        )
+    print("[migration v1] ALTER TABLE done.")
 
     return True
 
@@ -219,14 +140,9 @@ async def migration_v3_email_code_attempts(engine, db_url: str) -> bool:
     print("[migration v3] Adding email_codes.failed_attempts...")
 
     async with engine.begin() as conn:
-        if _is_sqlite(db_url):
-            await conn.exec_driver_sql(
-                "ALTER TABLE email_codes ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0"
-            )
-        else:
-            await conn.exec_driver_sql(
-                "ALTER TABLE email_codes ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0"
-            )
+        await conn.exec_driver_sql(
+            "ALTER TABLE email_codes ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0"
+        )
 
     print("[migration v3] Done.")
     return True
@@ -296,35 +212,20 @@ async def migration_v5_task_user_id(engine, db_url: str) -> bool:
         added = True
 
     # 回填历史任务的 user_id（幂等：只处理仍为 NULL 的行）
-    if _is_postgresql(db_url):
-        backfill_sql = """
-            UPDATE tasks t
-            SET user_id = c.owner_user_id
-            FROM collections c
-            WHERE t.user_id IS NULL
-              AND t.payload ->> 'collection_id' = c.id
-              AND c.owner_user_id IS NOT NULL
-        """
-    elif _is_sqlite(db_url):
-        backfill_sql = """
-            UPDATE tasks
-            SET user_id = (
-                SELECT c.owner_user_id FROM collections c
-                WHERE c.id = json_extract(tasks.payload, '$.collection_id')
-            )
-            WHERE user_id IS NULL
-              AND json_extract(payload, '$.collection_id') IS NOT NULL
-        """
-    else:
-        backfill_sql = None
-
-    if backfill_sql:
-        try:
-            async with engine.begin() as conn:
-                result = await conn.exec_driver_sql(backfill_sql)
-            print(f"[migration v5] Backfilled task user_id: {getattr(result, 'rowcount', '?')} rows.")
-        except Exception as e:
-            print(f"[migration v5] Backfill skipped: {e}")
+    backfill_sql = """
+        UPDATE tasks t
+        SET user_id = c.owner_user_id
+        FROM collections c
+        WHERE t.user_id IS NULL
+          AND t.payload ->> 'collection_id' = c.id
+          AND c.owner_user_id IS NOT NULL
+    """
+    try:
+        async with engine.begin() as conn:
+            result = await conn.exec_driver_sql(backfill_sql)
+        print(f"[migration v5] Backfilled task user_id: {getattr(result, 'rowcount', '?')} rows.")
+    except Exception as e:
+        print(f"[migration v5] Backfill skipped: {e}")
 
     print("[migration v5] Done.")
     return added
@@ -349,8 +250,8 @@ async def run_migrations_async(engine, db_url: str) -> list[str]:
     异步运行所有未执行的迁移（使用 SQLAlchemy engine）
 
     Args:
-        engine: SQLAlchemy 异步引擎
-        db_url: 数据库 URL，用于判断数据库类型
+        engine: SQLAlchemy 异步引擎（PostgreSQL）
+        db_url: 数据库 URL（保留用于日志/诊断）
 
     Returns:
         已执行的迁移名称列表
@@ -369,42 +270,19 @@ async def run_migrations_async(engine, db_url: str) -> list[str]:
     return applied
 
 
-def run_migrations(db_path: str | None = None) -> list[str]:
-    """
-    同步运行迁移（SQLite 本地文件用，命令行手动迁移）
+if __name__ == "__main__":
+    """命令行手动执行迁移（针对当前配置的 PostgreSQL）：
 
-    为避免与启动时的异步迁移逻辑不一致，此入口直接复用 run_migrations_async，
-    对指定 SQLite 文件执行全部迁移（v1–v5），不再单独维护一份同步实现。
+        uv run python -m app.core.migrations
     """
     import asyncio
 
-    from sqlalchemy.ext.asyncio import create_async_engine
+    from app.core.config import settings
+    from app.core.database import engine
 
-    if db_path is None:
-        db_path = "data/vdm.db"
+    async def _main() -> None:
+        applied = await run_migrations_async(engine, settings.database_url)
+        print(f"Applied migrations: {applied}" if applied else "No migrations needed.")
+        await engine.dispose()
 
-    if not os.path.exists(db_path):
-        return []
-
-    db_url = f"sqlite+aiosqlite:///{db_path}"
-
-    async def _run() -> list[str]:
-        engine = create_async_engine(db_url)
-        try:
-            return await run_migrations_async(engine, db_url)
-        finally:
-            await engine.dispose()
-
-    return asyncio.run(_run())
-
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        applied = run_migrations(sys.argv[1])
-    else:
-        applied = run_migrations()
-    if applied:
-        print(f"Applied migrations: {applied}")
-    else:
-        print("No migrations needed.")
+    asyncio.run(_main())

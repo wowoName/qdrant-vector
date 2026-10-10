@@ -3,17 +3,18 @@
 
 负责：
 - 将 Excel 文件流式读取为 RecordItem
-- 批量写入 SQLite（document_records 表）
+- 批量写入 PostgreSQL（document_records 表）
 - 为每条记录生成向量化文本
 - 调用 VectorService 将记录写入 Qdrant（语义索引）
 
 核心职责划分：
-- SQLite = 主存储（完整结构化数据，精确查询）
+- PostgreSQL = 主存储（完整结构化数据，精确查询）
 - Qdrant = 语义索引（用于语义搜索定位相关记录）
 """
 
 import uuid
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chunkers.base import RecordItem
@@ -25,11 +26,15 @@ from app.repositories.record_repo import RecordRepository
 logger = get_logger(__name__)
 
 
+class RecordImportConsistencyError(RuntimeError):
+    """结构化记录入库行数与实际落库行数不一致（疑似静默丢行）"""
+
+
 class DocumentRecordService:
     """
     文档记录服务
 
-    编排 Excel 流式读取 → SQLite 写入 → Qdrant 索引 的完整链路。
+    编排 Excel 流式读取 → PostgreSQL 写入 → Qdrant 索引 的完整链路。
     """
 
     def __init__(self, db: AsyncSession, collection_id: str = ""):
@@ -51,7 +56,7 @@ class DocumentRecordService:
         将 Excel 文件导入为结构化记录
 
         真正的流式导入：
-        Excel → 逐行读取 → 分批写入 SQLite → 分批返回记录供 Qdrant 索引
+        Excel → 逐行读取 → 分批写入 PostgreSQL → 分批返回记录供 Qdrant 索引
 
         Args:
             file_path: Excel 文件路径
@@ -81,6 +86,23 @@ class DocumentRecordService:
             await self.record_repo.bulk_insert(batch, batch_size=batch_size)
             total += len(batch)
 
+        # 一致性校验：流式读取到的行数必须与实际落库行数一致。
+        # 不一致说明入库过程中发生了静默丢行，会导致后续结构化查询（SUM/COUNT）少算数据，
+        # 必须让任务失败以便重试/排查，而不是"假成功"。
+        persisted = await self.db.scalar(
+            select(func.count(DocumentRecordDB.id)).where(
+                DocumentRecordDB.version_id == version_id
+            )
+        )
+        if persisted != total:
+            logger.error(
+                f"Record import row-count mismatch for doc {document_id}: "
+                f"streamed={total}, persisted={persisted} (silent row loss)"
+            )
+            raise RecordImportConsistencyError(
+                f"入库行数不一致：读取 {total} 行，实际落库 {persisted} 行"
+            )
+
         logger.info(f"Excel import complete: {total} records for doc {document_id}")
         return total
 
@@ -96,7 +118,7 @@ class DocumentRecordService:
         """
         导入 Excel 并同时建立 Qdrant 语义索引
 
-        流式处理：逐批读取 → 写入 SQLite → 向量化 → 写入 Qdrant
+        流式处理：逐批读取 → 写入 PostgreSQL → 向量化 → 写入 Qdrant
 
         Args:
             file_path: Excel 文件路径
@@ -124,7 +146,7 @@ class DocumentRecordService:
             batch_payloads.append(self._make_qdrant_payload(record_item, db_record))
 
             if len(batch_records) >= batch_size:
-                # 写入 SQLite
+                # 写入 PostgreSQL
                 await self.record_repo.bulk_insert(batch_records, batch_size=batch_size)
                 total_records += len(batch_records)
 
@@ -186,7 +208,7 @@ class DocumentRecordService:
         """
         统计某列去重值数量（结构化查询的核心能力）
 
-        直接走 SQLite，精确且快速。
+        直接走 PostgreSQL，精确且快速。
         """
         return await self.record_repo.count_distinct(document_id, column, filters)
 

@@ -21,7 +21,13 @@ export interface GroupedReference {
 
 export interface ChatMessage {
   role: 'user' | 'assistant'
+  /** 完整回答内容（流式累积后的最终文本） */
   content: string
+  /**
+   * 逐字输出时实际展示的文本。
+   * 仅流式回答过程中存在：逐渐追平 content，用于营造打字机效果。
+   */
+  display?: string
   reasoning?: string
   loading?: boolean
   references?: ChatReference[]
@@ -31,6 +37,10 @@ export interface ChatMessage {
   model?: string
   isKbAnswer?: boolean
   isCommand?: boolean
+  /** 当前所处阶段（rewrite / route / retrieve / synthesize），用于展示进度 */
+  stage?: string
+  /** 是否已知「是否命中知识库」；未到达前不渲染来源徽章，避免误判 */
+  kbKnown?: boolean
   groupedRefs?: GroupedReference[]
 }
 
@@ -68,6 +78,40 @@ export const useChatStore = defineStore('chat', () => {
   const useRewrite = ref(true)
 
   let abortController: AbortController | null = null
+
+  // ---------------- 打字机效果 ----------------
+  // 流式回答时按帧把 display 追平 content，制造逐字输出的观感
+  let streamMsg: ChatMessage | null = null
+  let rafId = 0
+
+  function tick() {
+    rafId = 0
+    const m = streamMsg
+    if (!m) return
+    const full = m.content
+    const shown = m.display || ''
+    if (shown.length >= full.length) {
+      // 已追平：流式结束后收尾
+      if (!isSending.value) streamMsg = null
+      return
+    }
+    // 自适应步长：积压越多追得越快，避免长回答出现明显延迟
+    const backlog = full.length - shown.length
+    const stepSize = Math.max(1, Math.ceil(backlog / 6))
+    m.display = shown + full.slice(shown.length, shown.length + stepSize)
+    rafId = requestAnimationFrame(tick)
+  }
+
+  function startTicker() {
+    if (rafId || !streamMsg) return
+    rafId = requestAnimationFrame(tick)
+  }
+
+  function stopTicker() {
+    if (rafId) cancelAnimationFrame(rafId)
+    rafId = 0
+    streamMsg = null
+  }
 
   const hasMessages = computed(() => messages.value.length > 0)
   const currentCollection = computed(() =>
@@ -111,6 +155,7 @@ export const useChatStore = defineStore('chat', () => {
       abortController.abort()
       abortController = null
     }
+    stopTicker()
     sessionId.value = ''
     messages.value = []
     collectionId.value = ''
@@ -128,6 +173,7 @@ export const useChatStore = defineStore('chat', () => {
         role: m.role as 'user' | 'assistant',
         content: m.content,
         isKbAnswer: m.role === 'assistant' && !m.content.includes('⚠️'),
+        kbKnown: true,
         showRefs: false,
         showReasoning: false,
       }))
@@ -181,6 +227,7 @@ export const useChatStore = defineStore('chat', () => {
     messages.value.push({
       role: 'assistant',
       content: '',
+      display: '',
       reasoning: '',
       loading: true,
       references: [],
@@ -191,6 +238,7 @@ export const useChatStore = defineStore('chat', () => {
     })
     // 取数组中的响应式代理，保证流式增量能触发视图更新
     const aiMsg = messages.value[messages.value.length - 1]
+    streamMsg = aiMsg
 
     abortController = new AbortController()
 
@@ -207,29 +255,48 @@ export const useChatStore = defineStore('chat', () => {
           stream: streamMode.value,
         },
         (event) => {
-          if (event.type === 'metadata') {
+          if (event.type === 'meta') {
+            // 会话就绪即到达：前端可立刻建立会话，无需等检索完成
+            if (event.session_id) sessionId.value = event.session_id
+          } else if (event.type === 'stage') {
+            // 阶段进度：start 时展示提示，done 时收起
+            aiMsg.stage = event.status === 'done' ? undefined : event.stage
+          } else if (event.type === 'metadata' || event.type === 'refs') {
             aiMsg.references = event.references || []
             aiMsg.groupedRefs = groupReferences(event.references || [])
             aiMsg.isKbAnswer = event.is_kb_answer ?? false
             aiMsg.isCommand = event.is_command ?? false
-            sessionId.value = event.session_id
+            aiMsg.kbKnown = true
+            aiMsg.stage = undefined
+            if (event.session_id) sessionId.value = event.session_id
           } else if (event.type === 'reasoning') {
             aiMsg.reasoning = (aiMsg.reasoning || '') + event.content
             aiMsg.showReasoning = true
-          } else if (event.type === 'content') {
+          } else if (event.type === 'content' || event.type === 'delta') {
             aiMsg.content += event.content
             aiMsg.loading = false
+            // 触发逐字输出
+            startTicker()
           } else if (event.type === 'done') {
-            aiMsg.content = stripNonKbWarning(event.answer || aiMsg.content)
+            const finalText = stripNonKbWarning(event.answer || aiMsg.content)
+            // 以最终答案为准：若已展示内容不是其前缀（如首尾空白被裁剪），重置重放
+            if (aiMsg.display !== undefined && !finalText.startsWith(aiMsg.display)) {
+              aiMsg.display = ''
+            }
+            aiMsg.content = finalText
             if (event.reasoning) {
               aiMsg.reasoning = event.reasoning
             }
             aiMsg.loading = false
+            aiMsg.stage = undefined
             aiMsg.latency = event.latency_ms
             aiMsg.model = event.model
             aiMsg.isKbAnswer = event.is_kb_answer ?? aiMsg.isKbAnswer
             aiMsg.isCommand = event.is_command ?? aiMsg.isCommand
+            aiMsg.kbKnown = true
+            startTicker()
           }
+          // type === 'ping'（心跳）等未知事件直接忽略
         },
         abortController.signal,
       )
@@ -248,6 +315,14 @@ export const useChatStore = defineStore('chat', () => {
     } finally {
       isSending.value = false
       abortController = null
+      if (!aiMsg.content) {
+        // 空回答兜底，避免一直停留在“正在输入”状态
+        aiMsg.content = '（未返回内容）'
+        aiMsg.display = aiMsg.content
+      } else if ((aiMsg.display || '').length < aiMsg.content.length) {
+        // 继续把剩余内容逐字补齐
+        startTicker()
+      }
     }
   }
 

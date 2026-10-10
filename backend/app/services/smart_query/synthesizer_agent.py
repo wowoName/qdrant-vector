@@ -16,9 +16,11 @@ SynthesizerAgent - 结果融合代理
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Optional
 
 from app.core.logging import get_logger
+from app.providers.llm.base import ChatMessage
 from app.providers.llm.factory import create_llm
 from .types import (
     FilterInfo,
@@ -61,6 +63,83 @@ class SynthesizerAgent:
     def __init__(self, use_llm_for_synthesis: bool = True):
         self.use_llm_for_synthesis = use_llm_for_synthesis
         self._llm = None
+        # 流式增量回调：绑定后，合成阶段的 LLM 调用会逐段把文本透传出去
+        self._delta_sink: Optional[Callable[[str], None]] = None
+        # 对话历史块：绑定后统一注入合成 prompt，用于多轮上下文理解
+        self._history_text: str = ""
+
+    def set_delta_sink(self, sink: Optional[Callable[[str], None]]) -> None:
+        """绑定 / 解绑流式增量回调（绑定后 LLM 合成走真流式）
+
+        仅影响文本产出的方式，不改变任何检索逻辑与最终答案内容：
+        累积所有增量后返回的字符串，与原先 simple_chat 的返回值一致。
+        """
+        self._delta_sink = sink
+
+    def set_history_text(self, history_text: Optional[str]) -> None:
+        """绑定 / 解绑对话历史块（已由 ContextWindowManager 完成压缩、蒸馏、丢弃）
+
+        仅在合成 prompt 中追加一段「最近对话」，用于多轮上下文理解；
+        不参与检索，也不改变检索结果。
+        """
+        self._history_text = history_text or ""
+
+    def _inject_history(self, system_prompt: Optional[str]) -> Optional[str]:
+        """把对话历史块追加到 system prompt（统一注入点，覆盖全部合成分支）"""
+        if not self._history_text:
+            return system_prompt
+        block = (
+            "\n\n【最近对话】（仅用于理解上下文指代与追问意图，"
+            "不要把这些内容当作本次回答的事实依据）\n"
+            f"{self._history_text}"
+        )
+        return (system_prompt or "") + block
+
+    async def _llm_text(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """调用 LLM 生成文本。
+
+        - 未绑定 delta_sink：与 BaseLLM.simple_chat 行为完全一致（非流式）
+        - 已绑定 delta_sink：走 chat_stream，逐段回调，最后返回拼接结果
+        """
+        llm = self._get_llm()
+        if llm is None:
+            raise RuntimeError("LLM 不可用")
+
+        # 统一注入对话历史（多轮上下文），覆盖所有合成分支
+        system_prompt = self._inject_history(system_prompt)
+
+        sink = self._delta_sink
+        if sink is None:
+            return await llm.simple_chat(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        # 与 BaseLLM.simple_chat 完全一致的 messages 构造，保证输入相同
+        messages: list[ChatMessage] = []
+        if system_prompt:
+            messages.append(ChatMessage("system", system_prompt))
+        messages.append(ChatMessage("user", prompt))
+
+        parts: list[str] = []
+        async for chunk in llm.chat_stream(
+            messages, temperature=temperature, max_tokens=max_tokens
+        ):
+            if chunk.get("type") != "content":
+                continue
+            piece = chunk.get("content", "")
+            if piece:
+                parts.append(piece)
+                sink(piece)
+        return "".join(parts)
 
     def _get_llm(self):
         """获取 LLM 实例（懒加载）"""
@@ -132,7 +211,7 @@ class SynthesizerAgent:
         )
 
         try:
-            answer = await llm.simple_chat(
+            answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=system_prompt,
                 temperature=0.3,
@@ -435,6 +514,46 @@ class SynthesizerAgent:
             logger.warning(f"附加明细下载链接失败: {e}")
             return answer
 
+    def _answer_projection(self, plan: QueryPlan, hits: list) -> Optional[str]:
+        """属性定向回答：从命中记录中抽取"用户所问的那一列"，直接给出答案。
+
+        用于"胡兰桂在哪个部门"这类问题（实体 + 指定属性），避免把整行明细
+        拼成表格返回。数据来自 hit.payload（Record 模式已把整行结构化数据放进 payload）。
+
+        Returns:
+            定向答案文本；返回 None 表示无法定向（回退到常规合成流程）。
+        """
+        column = (plan.projection_column or "").strip()
+        if not column or not hits:
+            return None
+
+        values: list[str] = []
+        for h in hits:
+            payload = h.payload or {}
+            # 聚合 / 去重列表类 hit 的 payload 不是整行数据，跳过
+            if payload.get("type") in ("aggregate", "distinct_list"):
+                continue
+            raw = payload.get(column)
+            if raw is None:
+                continue
+            val = str(raw).strip()
+            if not val:
+                continue
+            if val not in values:
+                values.append(val)
+
+        if not values:
+            return None
+
+        filter_desc = self._describe_filters(plan.filters) if plan.filters else ""
+        subject = f"{filter_desc}的" if filter_desc else ""
+
+        if len(values) == 1:
+            return f"{subject}{column}：**{values[0]}**"
+
+        listed = "\n".join(f"- {v}" for v in values)
+        return f"{subject}{column}（共 {len(values)} 个）：\n\n{listed}"
+
     async def synthesize_multi(
         self,
         query: str,
@@ -464,6 +583,19 @@ class SynthesizerAgent:
             answer = self._synthesize_failure_multi(query, plan, multi_result)
             references = self._build_references_multi(multi_result, context)
             return answer, references
+
+        # 属性定向问答：用户问的是"某实体的某属性"（如"胡兰桂在哪个部门"），
+        # 直接回答该属性值，避免把整行明细 dump 成表格
+        if has_sql and plan.projection_column:
+            projection_answer = self._answer_projection(plan, multi_result.sql_hits)
+            if projection_answer:
+                references = self._build_references_multi(multi_result, context)
+                return (
+                    self._append_detail_download_link(
+                        projection_answer, multi_result.sql_hits
+                    ),
+                    references,
+                )
 
         # 如果 SQL 有聚合结果（精确统计），优先用 SQL
         if has_sql and self._is_aggregate_sql(multi_result.sql_hits):
@@ -516,7 +648,7 @@ class SynthesizerAgent:
             if llm is not None:
                 try:
                     context_text = self._build_multi_context(multi_result, plan)
-                    answer = await llm.simple_chat(
+                    answer = await self._llm_text(
                         prompt=f"用户问题：{query}",
                         system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context_text,
                         temperature=0.3,
@@ -587,7 +719,7 @@ class SynthesizerAgent:
         try:
             context_text = self._build_multi_context(multi_result, plan)
 
-            answer = await llm.simple_chat(
+            answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context_text,
                 temperature=0.5,
@@ -955,6 +1087,33 @@ class SynthesizerAgent:
     # 主入口（旧接口，向后兼容）
     # ------------------------------------------------------------------
 
+    async def synthesize_from_hits(
+        self,
+        query: str,
+        plan: QueryPlan,
+        sql_hits: Optional[list] = None,
+        vector_hits: Optional[list] = None,
+        context: Optional[AgentContext] = None,
+    ) -> tuple[str, list[dict]]:
+        """从原始 hit 列表合成回答（供多意图路径的降级场景使用）
+
+        内部完成 RetrievalHit → SQLQueryResult / RetrievalQueryResult 的转换，
+        调用方无需依赖私有转换方法，也避免参数签名不匹配。
+
+        Args:
+            query: 原始用户问题
+            plan: 查询计划
+            sql_hits: SQL 命中列表（RetrievalHit）
+            vector_hits: 向量命中列表（RetrievalHit）
+            context: Agent 上下文
+
+        Returns:
+            (answer, references) 元组
+        """
+        sql_result = self._hits_to_sql_result(sql_hits, plan) if sql_hits else None
+        retrieval_result = self._hits_to_retrieval_result(vector_hits) if vector_hits else None
+        return await self.synthesize(query, plan, sql_result, retrieval_result, context)
+
     async def synthesize(
         self,
         query: str,
@@ -1049,7 +1208,7 @@ class SynthesizerAgent:
 
 共 {total_display} 条结果（展示前 {sql_result.row_count} 条）。"""
 
-            answer = await llm.simple_chat(
+            answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context,
                 temperature=0.3,
@@ -1186,7 +1345,7 @@ class SynthesizerAgent:
         try:
             context = self._build_retrieval_context(retrieval_result)
 
-            answer = await llm.simple_chat(
+            answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n参考资料：\n" + context,
                 temperature=0.7,
@@ -1253,7 +1412,7 @@ class SynthesizerAgent:
 相关参考资料（语义检索）：
 {retrieval_context}"""
 
-            answer = await llm.simple_chat(
+            answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context,
                 temperature=0.5,

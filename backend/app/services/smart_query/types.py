@@ -213,6 +213,14 @@ class QueryPlan:
     target_column_alias: str = ""
     """目标列的中文名称"""
 
+    projection_column: str = ""
+    """投影列（仅用于答案展示）
+
+    表达"用户想看某个实体的哪个属性"，例如"胡兰桂在哪个部门" → 部门。
+    只在合成阶段做定向回答时使用，**不参与检索与过滤条件构造**，
+    因此不会与"实体同名列"冲突（该冲突正是 DETAIL 不使用 target_column 的原因）。
+    """
+
     filters: list[FilterInfo] = field(default_factory=list)
     """过滤条件列表（强类型）"""
 

@@ -743,3 +743,69 @@ class ContextWindowManager:
         """
         threshold = self.history_budget * settings.chat_compaction_threshold
         return history_tokens > threshold
+
+    # ------------------------------------------------------------------
+    # 历史文本块（供不组装 messages 的生成路径使用，如 SmartQuery 合成）
+    # ------------------------------------------------------------------
+
+    def build_history_block(
+        self,
+        history_messages: list[dict],
+        summaries: SummaryBundle,
+        current_query: str = "",
+    ) -> tuple[str, list[str]]:
+        """把对话历史压缩/蒸馏/丢弃后，渲染成一段可直接注入 prompt 的文本块。
+
+        与 assemble() 共用同一套 TokenBudgetComposedStrategy，保证两条生成路径
+        （常规 RAG / SmartQuery 合成）的上下文策略完全一致：
+
+          1. 压缩：工具结果裁剪（ToolResultPruning）
+          2. 蒸馏：分层摘要替换（Summarization，far/mid/near）
+          3. 丢弃：滑动窗口丢最旧轮次（SlidingWindow）→ 紧急截断（Truncation）
+
+        Args:
+            history_messages: 历史消息（按 seq 升序，含 role/content/token_count/seq/turn_id）
+            summaries: 分层摘要包
+            current_query: 当前问题（用于扣除 query 占用的 token）
+
+        Returns:
+            (history_text, applied_strategies)
+            history_text 为空字符串表示无可用历史。
+        """
+        if not history_messages:
+            return "", []
+
+        # 与 assemble() 一致的预算口径：历史预算 - 当前问题占用
+        available = self.history_budget - count_tokens(current_query)
+        if available < 200:
+            available = 200
+
+        composed = TokenBudgetComposedStrategy(
+            summaries=summaries,
+            tool_max_tokens=settings.chat_tool_result_max_tokens,
+            tool_keep_recent=3,
+            sliding_min_turns=2,
+            trunc_min_messages=2,
+        )
+        compressed, applied = composed.apply(history_messages, available)
+
+        parts: list[str] = []
+        for m in compressed:
+            if m.get("_is_summary"):
+                parts.append(f"【历史摘要】{m.get('content', '')}")
+                continue
+            role = m.get("role")
+            if role == "user":
+                parts.append(f"用户：{m.get('content', '')}")
+            elif role == "assistant":
+                parts.append(f"助手：{m.get('content', '')}")
+            # tool / system 等内部消息不进对话历史块
+
+        if not parts:
+            return "", applied
+
+        logger.debug(
+            f"History block built: msgs={len(compressed)}, applied={applied}, "
+            f"chars={sum(len(p) for p in parts)}"
+        )
+        return "\n".join(parts), applied

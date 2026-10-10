@@ -90,8 +90,8 @@
                   <span v-if="msg.isCommand" class="meta-tag">系统消息</span>
                 </div>
 
-                <!-- 来源徽章 -->
-                <div v-if="!msg.loading && msg.content && !msg.isCommand" class="badge-row">
+                <!-- 来源徽章（知识库命中与否已知后才渲染，避免流式期间误判） -->
+                <div v-if="!msg.loading && msg.content && !msg.isCommand && msg.kbKnown" class="badge-row">
                   <span v-if="msg.isKbAnswer" class="badge ok">
                     <el-icon :size="12"><Reading /></el-icon>知识库回答
                   </span>
@@ -116,22 +116,23 @@
                 </div>
 
                 <!-- 答案面板 -->
-                <div class="answer-panel" :class="{ 'is-warn': !msg.isKbAnswer && !msg.isCommand && !msg.loading, 'is-cmd': msg.isCommand }">
-                  <div v-if="msg.loading" class="typing">
+                <div class="answer-panel" :class="{ 'is-warn': !msg.isKbAnswer && !msg.isCommand && !msg.loading && msg.kbKnown, 'is-cmd': msg.isCommand }">
+                  <div v-if="showTyping(msg)" class="typing">
                     <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                    <span v-if="msg.stage" class="typing-stage">{{ stageLabel(msg.stage) }}</span>
                   </div>
                   <template v-else>
                     <div class="answer-head">
                       <el-icon :size="15"><ChatDotRound /></el-icon>
                       <span>{{ msg.isCommand ? '系统消息' : '最终答案' }}</span>
                     </div>
-                    <div class="answer-body markdown-content" v-html="renderMarkdown(msg.content)"></div>
+                    <div class="answer-body markdown-content" v-html="answerHtml(msg)"></div>
                   </template>
                 </div>
 
                 <!-- 非知识库警示 -->
                 <div
-                  v-if="!msg.loading && msg.content && !msg.isKbAnswer && chat.collectionId && !msg.isCommand"
+                  v-if="!msg.loading && msg.content && !msg.isKbAnswer && chat.collectionId && !msg.isCommand && msg.kbKnown"
                   class="warn-panel"
                 >
                   <el-icon class="warn-icon" :size="17"><WarningFilled /></el-icon>
@@ -199,7 +200,6 @@
               </template>
             </div>
           </div>
-          <div ref="bottomRef"></div>
         </div>
       </div>
 
@@ -354,7 +354,6 @@ const kbSearchKeyword = ref('')
 const pendingCollection = ref('')
 
 const messageListRef = ref<HTMLElement | null>(null)
-const bottomRef = ref<HTMLElement | null>(null)
 
 const quickQuestions = [
   '介绍一下系统的主要功能',
@@ -368,9 +367,18 @@ const filteredCollections = computed(() => {
   return chat.collections.filter((c) => c.name.toLowerCase().includes(kw))
 })
 
-function scrollToBottom() {
+/** 是否贴近底部（用于流式输出时自动跟随，避免打断用户上翻查看） */
+function isNearBottom(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 140
+}
+
+/** 滚动到底部；用户已上翻查看历史时不强制跟随 */
+function scrollToBottom(force = false) {
+  const el = messageListRef.value
+  if (!force && el && !isNearBottom(el)) return
   nextTick(() => {
-    bottomRef.value?.scrollIntoView({ behavior: 'smooth' })
+    const target = messageListRef.value
+    if (target) target.scrollTop = target.scrollHeight
   })
 }
 
@@ -381,6 +389,35 @@ function renderMarkdown(text: string): string {
   } catch {
     return text
   }
+}
+
+const STAGE_LABELS: Record<string, string> = {
+  rewrite: '正在理解问题…',
+  route: '正在分析问题类型…',
+  retrieve: '正在检索知识库…',
+  synthesize: '正在生成回答…',
+}
+
+/** 流式阶段提示文案 */
+function stageLabel(stage: string) {
+  return STAGE_LABELS[stage] || '处理中…'
+}
+
+/** 是否显示“正在输入”三点：等待首个内容，或已收到内容但还没开始逐字展示 */
+function showTyping(msg: ChatMessage) {
+  return !!msg.loading || (msg.display !== undefined && msg.display === '')
+}
+
+/** 是否正在逐字输出（尚未追平完整内容） */
+function isTypingOut(msg: ChatMessage) {
+  return msg.display !== undefined && msg.display.length < msg.content.length
+}
+
+/** 答案 HTML：逐字输出时在末尾追加闪烁光标 */
+function answerHtml(msg: ChatMessage): string {
+  const text = msg.display !== undefined ? msg.display : msg.content
+  const html = renderMarkdown(text)
+  return isTypingOut(msg) ? `${html}<span class="typing-caret"></span>` : html
 }
 
 function scoreColor(score: number) {
@@ -562,9 +599,12 @@ watch(
   },
 )
 
-watch(() => chat.messages.length, scrollToBottom)
+watch(() => chat.messages.length, () => scrollToBottom())
 watch(
-  () => chat.messages[chat.messages.length - 1]?.content,
+  () => {
+    const m = chat.messages[chat.messages.length - 1]
+    return m ? (m.display !== undefined ? m.display : m.content) : ''
+  },
   () => scrollToBottom(),
 )
 
@@ -575,7 +615,7 @@ onMounted(async () => {
   if (sid && sid !== chat.sessionId) {
     await chat.loadConversation(sid)
   }
-  scrollToBottom()
+  scrollToBottom(true)
 })
 </script>
 
@@ -978,10 +1018,29 @@ onMounted(async () => {
   word-break: break-word;
 }
 
+/* 流式输出的打字光标 */
+.answer-body :deep(.typing-caret) {
+  display: inline-block;
+  width: 9px;
+  height: 1.05em;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #3d7dff, #22d3ee);
+  box-shadow: 0 0 10px rgba(61, 125, 255, 0.85);
+  animation: vdm-caret 1s steps(1, end) infinite;
+}
+
 .typing {
   display: inline-flex;
+  align-items: center;
   gap: 5px;
   padding: 8px 2px;
+}
+.typing-stage {
+  margin-left: 6px;
+  font-size: 12.5px;
+  color: var(--vdm-text-mute);
 }
 .typing .dot {
   width: 7px;

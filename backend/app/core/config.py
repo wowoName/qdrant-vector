@@ -26,14 +26,14 @@ class Settings(BaseSettings):
     workers: int = 1
 
     # ---------- 主数据库配置（业务元数据：集合/文档/任务/上传 等） ----------
-    db_driver: str = "sqlite+aiosqlite"
-    db_path: str = "./data/vdm.db"
+    # 统一使用 PostgreSQL（不再支持 SQLite）
+    db_driver: str = "postgresql+asyncpg"
     db_host: str | None = None
     db_port: int | None = None
     db_user: str | None = None
     db_password: str | None = None
     db_name: str | None = None
-    # 数据库连接池大小（PostgreSQL 有效，SQLite 忽略）
+    # 数据库连接池大小
     db_pool_size: int = 20
     # 数据库连接池最大溢出连接数
     db_max_overflow: int = 10
@@ -44,8 +44,6 @@ class Settings(BaseSettings):
     # 不配置则使用主库（默认行为），配置后对话数据独立存储
     chat_db_enabled: bool = False
     chat_db_driver: str = "postgresql+asyncpg"
-    # SQLite 模式下使用的数据库文件路径
-    chat_db_path: str = "./data/chat.db"
     chat_db_host: str | None = None
     chat_db_port: int | None = None
     chat_db_user: str | None = None
@@ -379,11 +377,17 @@ class Settings(BaseSettings):
     # SmartQuery 的 LLM 模型（None 则用全局默认）
     smart_query_llm_model: str | None = None
 
+    # ---------- 流式输出配置 ----------
+    # SSE 心跳间隔（秒）：前置阶段暂无内容时保活，防止网关/代理空闲断连
+    stream_heartbeat_sec: int = 12
+    # 合成阶段是否真流式（LLM delta 直透传，而非等整段生成完再一次性下发）
+    smart_query_stream_synthesis: bool = True
+    # 合成阶段是否注入对话历史（多轮上下文理解；关闭可回退到"无历史"行为）
+    smart_query_use_history: bool = True
+
     @property
     def database_url(self) -> str:
-        """构造主数据库连接 URL"""
-        if self.db_driver.startswith("sqlite"):
-            return f"{self.db_driver}:///{self.db_path}"
+        """构造主数据库连接 URL（PostgreSQL）"""
         return (
             f"{self.db_driver}://"
             f"{self.db_user}:{self.db_password}@"
@@ -395,8 +399,6 @@ class Settings(BaseSettings):
         """构造对话数据库连接 URL，未启用则返回 None（使用主库）"""
         if not self.chat_db_enabled:
             return None
-        if self.chat_db_driver.startswith("sqlite"):
-            return f"{self.chat_db_driver}:///{self.chat_db_path}"
         return (
             f"{self.chat_db_driver}://"
             f"{self.chat_db_user}:{self.chat_db_password}@"

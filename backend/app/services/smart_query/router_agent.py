@@ -265,6 +265,10 @@ class RouterAgent:
         # 统一的目标列后处理（修正各种目标列相关的问题）
         self._finalize_target_column(final_plan, schema)
 
+        # 兜底：规则阶段识别出的"属性投影"在 LLM 融合后可能丢失，补回
+        if not final_plan.projection_column and rule_based_plan.projection_column:
+            final_plan.projection_column = rule_based_plan.projection_column
+
         # Step 5: 根据查询类型计算建议的 top_k
         final_plan.suggested_top_k = self._calc_suggested_top_k(final_plan)
 
@@ -768,16 +772,18 @@ class RouterAgent:
         2. LIST/DETAIL + 目标列与实体列同名：用户是想查这个实体的详情，不是要列出所有值
         """
         # --- 场景1：DETAIL/EXISTS 操作不应该有目标列 ---
-        # DETAIL 是查整行详情，EXISTS 是判断是否存在，都不需要目标列
+        # DETAIL 是查整行详情，EXISTS 是判断是否存在，都不需要目标列参与检索
         if plan.operation in (QueryOperation.DETAIL, QueryOperation.EXISTS):
-            if plan.target_column and plan.entities:
+            target_col = plan.target_column
+            if target_col and plan.entities:
                 # 有目标列 + 有实体 → 把目标列+实体转为过滤条件
-                target_col = plan.target_column
                 matching_entities = [
                     e for e in plan.entities
                     if e.column_name == target_col and e.name
                 ]
                 if matching_entities:
+                    # 实体与目标列同名（如"余宇诺的相关信息"，实体"余宇诺"落在"姓名"列）
+                    # → 用户想要的是整行详情，转成过滤条件
                     for ent in matching_entities:
                         existing = any(
                             f.column == target_col and f.value == ent.name
@@ -790,7 +796,12 @@ class RouterAgent:
                                 value=ent.name,
                                 entity_name=ent.name,
                             ))
-            # 清空目标列
+                elif not plan.projection_column:
+                    # 目标列与实体所在列不同（如"胡兰桂在哪个部门"：实体在"姓名"列、目标列是"部门"）
+                    # → 这是"问某实体的某属性"，记录为投影列供合成阶段定向回答。
+                    # 不参与检索，因此不会影响过滤条件构造。
+                    plan.projection_column = target_col
+            # 清空目标列（检索仍按整行返回，保持原有行为）
             plan.target_column = ""
             plan.target_column_alias = ""
             return

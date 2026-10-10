@@ -1,6 +1,6 @@
 """
 重建向量索引脚本
-从 SQLite 数据库读取所有 chunk，重新生成 embedding 并写入 Qdrant
+从 PostgreSQL 数据库读取所有 chunk，重新生成 embedding 并写入 Qdrant
 
 用法:
     .venv\Scripts\python.exe rebuild_vectors.py [collection_id]

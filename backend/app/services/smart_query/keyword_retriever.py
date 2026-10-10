@@ -1,7 +1,7 @@
 """
 关键词检索器（字面匹配）
 
-基于 SQLite 的 LIKE 查询，做关键词全文检索。
+基于 PostgreSQL 的 LIKE 查询，做关键词全文检索。
 作为 SQL（精确结构化）和 Vector（语义模糊）之间的补充。
 
 适用场景：
@@ -23,6 +23,7 @@ from .types import (
     TableSchema,
 )
 from app.core.logging import get_logger
+from app.core.sql_compat import safe_rollback
 
 logger = get_logger(__name__)
 
@@ -31,7 +32,7 @@ class KeywordRetriever(BaseRetriever):
     """
     关键词检索器
 
-    基于 SQLite LIKE 的字面匹配检索。
+    基于 PostgreSQL LIKE 的字面匹配检索。
     从查询中提取关键词，在 vector_text / data_json 中搜索。
     """
 
@@ -66,6 +67,8 @@ class KeywordRetriever(BaseRetriever):
 
         except Exception as e:
             logger.error(f"Keyword retrieval failed: {e}")
+            # 回滚失败事务，避免污染共用 session 导致其它检索路径级联失败
+            await safe_rollback(self.db)
 
         elapsed_ms = (time.time() - start) * 1000
         for i, hit in enumerate(hits):
@@ -116,7 +119,7 @@ class KeywordRetriever(BaseRetriever):
     async def _search_keywords(
         self, keywords: List[str], schema: TableSchema, top_k: int
     ) -> List[RetrievalHit]:
-        """在 SQLite 中做 LIKE 关键词搜索"""
+        """在 PostgreSQL 中做 LIKE 关键词搜索"""
         from app.models.db.document_record import DocumentRecordDB
 
         hits: List[RetrievalHit] = []

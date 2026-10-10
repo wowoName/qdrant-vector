@@ -1,5 +1,5 @@
 """
-文档记录仓储（SQLite 结构化记录）
+文档记录仓储（PostgreSQL 结构化记录）
 
 负责 Excel Record 模式下的结构化记录存储与查询。
 
@@ -9,7 +9,7 @@
 - 按记录 ID 获取完整数据
 
 设计理念：
-- SQLite = 查（精确结构化查询）
+- PostgreSQL = 查（精确结构化查询）
 - Qdrant = 找（语义搜索定位）
 """
 
@@ -19,6 +19,7 @@ from sqlalchemy import delete, func, select, text, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
+from app.core.sql_compat import json_text
 from app.models.db.document_record import DocumentRecordDB
 
 logger = get_logger(__name__)
@@ -163,12 +164,11 @@ class RecordRepository:
             result = await self.db.execute(stmt)
             return result.scalar() or 0
 
-        # 如果涉及 JSON 字段，使用 SQLite 的 json_extract
-        # 注意：SQLite JSON 函数需要 sqlite3 >= 3.9.0
+        # 如果涉及 JSON 字段，使用方言化的 JSON 取值表达式
         target_expr = (
             indexed_cols[column_name].name
             if target_is_indexed
-            else f"json_extract(data_json, '$.{column_name}')"
+            else json_text("data_json", column_name)
         )
 
         where_clauses = ["document_id = :doc_id"]
@@ -181,7 +181,7 @@ class RecordRepository:
                     params[f"filter_{col}"] = val
                 else:
                     where_clauses.append(
-                        f"json_extract(data_json, '$.{col}') = :filter_{col}"
+                        f"{json_text('data_json', col)} = :filter_{col}"
                     )
                     params[f"filter_{col}"] = val
 
@@ -247,7 +247,7 @@ class RecordRepository:
                     params[f"f_{col}"] = val
                 else:
                     where_clauses.append(
-                        f"json_extract(data_json, '$.{col}') = :f_{col}"
+                        f"{json_text('data_json', col)} = :f_{col}"
                     )
                     params[f"f_{col}"] = val
 
@@ -335,12 +335,13 @@ class RecordRepository:
             result = await self.db.execute(stmt)
             return [r for r in result.scalars().all() if r]
 
-        # JSON 字段
+        # JSON 字段（PostgreSQL 不允许在 WHERE 中引用 SELECT 别名，这里内联表达式）
+        expr = json_text("data_json", column_name)
         sql = text(
-            f"SELECT DISTINCT json_extract(data_json, '$.{column_name}') AS val "
+            f"SELECT DISTINCT {expr} AS val "
             f"FROM document_records "
             f"WHERE document_id = :doc_id "
-            f"AND val IS NOT NULL AND val != '' "
+            f"AND {expr} IS NOT NULL AND {expr} != '' "
             f"LIMIT :limit"
         )
         result = await self.db.execute(sql, {"doc_id": document_id, "limit": limit})

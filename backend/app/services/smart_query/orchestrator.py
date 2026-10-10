@@ -911,16 +911,28 @@ class SmartQueryOrchestrator:
             context.is_kb_answer = True
         except Exception as e:
             logger.error(f"Multi-query synthesis failed: {e}")
-            # 降级：用所有 hit 走普通合成
+            # 降级：用所有 hit 走普通合成（synthesize_from_hits 内部完成 hit → 结果对象转换）
             try:
-                context.final_answer = await self.synthesizer_agent.synthesize(
+                fallback_plan = context.query_plan
+                if fallback_plan is None:
+                    from .types import QueryOperation
+
+                    fallback_plan = QueryPlan(
+                        intent=QueryIntent.SEMANTIC,
+                        operation=QueryOperation.UNKNOWN,
+                        needs_sql=False,
+                        needs_vector=True,
+                        reasoning="多意图降级合成",
+                        confidence=0.5,
+                    )
+                answer, _refs = await self.synthesizer_agent.synthesize_from_hits(
                     query=context.query,
-                    sql_results=[],
-                    retrieval_results=[],
+                    plan=fallback_plan,
                     sql_hits=all_sql_hits,
                     vector_hits=all_vector_hits,
-                    history_messages=history_messages,
+                    context=context,
                 )
+                context.final_answer = answer
                 context.is_kb_answer = True
             except Exception as e2:
                 logger.error(f"Fallback synthesis also failed: {e2}")

@@ -325,7 +325,7 @@ class ConversationRepository:
         self, conversation_id: str
     ) -> List[ConversationSummaryDB]:
         """获取所有层级的摘要（按层级 far→mid→near 排序）"""
-        # 用 CASE WHEN 实现自定义排序，兼容 SQLite / PostgreSQL / MySQL
+        # 用 CASE WHEN 实现自定义排序
         level_order = case(
             (ConversationSummaryDB.level == "far", 0),
             (ConversationSummaryDB.level == "mid", 1),

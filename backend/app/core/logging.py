@@ -54,7 +54,6 @@ def setup_logging() -> None:
     logging.getLogger("qdrant_client").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
     logging.getLogger("asyncpg").setLevel(logging.WARNING)
     logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 

@@ -18,6 +18,7 @@
 - 自动降级：页级流式是最后防线，32GB 内存也能处理 100MB+ PDF
 """
 
+import asyncio
 import os
 import time
 
@@ -207,10 +208,13 @@ async def _import_records_for_document(
     将 Excel 数据导入为结构化记录（document_records 表）。
 
     仅在 record 模式下调用。
-    使用 DocumentRecordService 流式写入 SQLite。
+    使用 DocumentRecordService 流式写入 PostgreSQL。
     """
     try:
-        from app.services.document_record_service import DocumentRecordService
+        from app.services.document_record_service import (
+            DocumentRecordService,
+            RecordImportConsistencyError,
+        )
 
         record_svc = DocumentRecordService(db=db, collection_id=collection_id)
         total = await record_svc.import_excel(
@@ -221,6 +225,11 @@ async def _import_records_for_document(
         )
         logger.info(f"Record import complete: {total} records for doc {document_id}")
         return total
+    except RecordImportConsistencyError:
+        # 静默丢行属于数据完整性问题：不能让任务"假成功"，
+        # 直接上抛让任务失败（上层会 rollback 未提交数据并标记失败/重试）
+        logger.error("Record import consistency check failed; failing the task", exc_info=True)
+        raise
     except Exception as e:
         logger.error(f"Failed to import records: {e}", exc_info=True)
         return 0

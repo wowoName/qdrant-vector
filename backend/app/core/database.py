@@ -1,7 +1,8 @@
 """
-数据库连接与初始化
+数据库连接与初始化（PostgreSQL）
 """
 
+from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 
@@ -22,14 +23,11 @@ _engine_kwargs = {
     "future": True,
 }
 
-if "sqlite" in settings.db_driver:
-    _engine_kwargs["connect_args"] = {"check_same_thread": False}
-else:
-    # PostgreSQL / MySQL 等服务端数据库：启用连接池
-    _engine_kwargs["pool_size"] = settings.db_pool_size
-    _engine_kwargs["max_overflow"] = settings.db_max_overflow
-    _engine_kwargs["pool_recycle"] = settings.db_pool_recycle
-    _engine_kwargs["pool_pre_ping"] = True  # 连接前先 ping，确保连接有效
+# PostgreSQL 连接池配置
+_engine_kwargs["pool_size"] = settings.db_pool_size
+_engine_kwargs["max_overflow"] = settings.db_max_overflow
+_engine_kwargs["pool_recycle"] = settings.db_pool_recycle
+_engine_kwargs["pool_pre_ping"] = True  # 连接前先 ping，确保连接有效
 
 # 异步引擎
 engine = create_async_engine(
@@ -74,7 +72,18 @@ async def get_db() -> AsyncSession:
     async with async_session() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise
+        else:
+            try:
+                await session.commit()
+            except PendingRollbackError:
+                # 会话已被标记为"待回滚"：说明本次请求中有语句失败，
+                # 但异常被上层捕获（如 SSE 生成器）未上抛，此时提交必然失败。
+                # 直接回滚并告警，避免 PendingRollbackError 掩盖真正的失败原因。
+                await session.rollback()
+                logger.error(
+                    "DB session was in a failed transaction at teardown; rolled back "
+                    "instead of committing. Look for the earlier error in this request."
+                )

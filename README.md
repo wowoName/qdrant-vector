@@ -6,7 +6,7 @@
 
 - **后端**：Python 3.11+ / FastAPI / SQLAlchemy / Qdrant / HuggingFace Embeddings
 - **前端**：Vue 3.5 / TypeScript / Vite / Element Plus / UnoCSS / Pinia
-- **存储**：SQLite（默认）/ PostgreSQL（可选）/ Qdrant 向量库 / Redis 缓存
+- **存储**：PostgreSQL（元数据与结构化记录）/ Qdrant 向量库 / Redis 缓存
 
 ## 项目结构
 

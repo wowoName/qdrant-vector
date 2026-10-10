@@ -5,7 +5,7 @@ Excel 文档处理器
 1. **Record 模式（默认）** — 业务型 Excel
    - 一行 = 一条结构化记录
    - 真正的流式读取（read_only 模式，逐行 yield）
-   - SQLite 存完整记录，Qdrant 存语义索引
+   - PostgreSQL 存完整记录，Qdrant 存语义索引
 
 2. **Chunk 模式（兼容旧流程）** — 文档型 Excel
    - 使用 TabularChunker，支持 row / row_group / column_group / sql

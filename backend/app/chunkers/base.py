@@ -27,7 +27,7 @@ class RecordItem:
     结构化记录项（业务型 Excel 的主数据模型）
 
     一行 = 一条 Record，而不是传统的 Chunk。
-    - SQLite 保存完整结构化记录
+    - PostgreSQL 保存完整结构化记录
     - Qdrant 保存语义索引（基于 text 字段做 embedding）
     """
 
