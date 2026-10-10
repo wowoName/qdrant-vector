@@ -1,0 +1,22 @@
+# 构建上下文不需要的文件（减小镜像、避免把密钥/大数据打进镜像）
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 运行时数据由 compose 卷挂载，不打进镜像
+data/
+
+# 环境变量与密钥
+.env
+.env.*
+
+# 日志
+*.log
+
+# Docker 自身
+Dockerfile
+.dockerignore

@@ -14,6 +14,7 @@ from app.core.exceptions import (
     UnsupportedFileTypeError,
 )
 from app.core.logging import get_logger
+from app.core.storage_quota import check_storage_quota
 from app.models.db.document import ChunkDB, DocumentDB, DocumentVersionDB
 from app.models.schemas.document import (
     SimpleUploadResponse,
@@ -89,7 +90,7 @@ class DocumentService:
         """
         # 校验 Collection
         coll_svc = CollectionService(self.db)
-        await coll_svc.get_by_id(collection_id)
+        collection = await coll_svc.get_by_id(collection_id)
 
         # 校验文件大小
         file_size = os.path.getsize(file_path)
@@ -152,6 +153,13 @@ class DocumentService:
                     task_id=None,
                 )
 
+            # 租户磁盘配额校验：替换文件仅计入增量占用
+            await check_storage_quota(
+                self.db,
+                collection.owner_user_id,
+                max(0, file_size - (existing_doc.file_size or 0)),
+            )
+
             # 创建新版本
             new_version_num = await self._get_next_version_num(existing_doc.id)
             storage_path = self._make_storage_path(
@@ -176,6 +184,9 @@ class DocumentService:
 
             doc_id = existing_doc.id
         else:
+            # 租户磁盘配额校验：新增文档计入完整文件大小
+            await check_storage_quota(self.db, collection.owner_user_id, file_size)
+
             # 创建新文档
             doc_id = generate_id()
             storage_path = self._make_storage_path(collection_id, doc_id, f"v1_{filename}")

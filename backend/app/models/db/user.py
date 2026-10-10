@@ -15,7 +15,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, Index, String
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, Index, String
 
 from app.core.database import Base
 
@@ -42,8 +42,14 @@ class UserDB(Base):
     is_verified = Column(Boolean, nullable=False, default=False)
     # 注册日期
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    # 注册来源 IP（用于限制同一 IP 只能注册一个租户）
+    register_ip = Column(String(64), nullable=True, index=True)
     # 过期日期（None 表示永不过期），过期后禁止登录和使用
     expires_at = Column(DateTime, nullable=True, index=True)
+    # 磁盘配额（字节）：仅租户（tenant_admin）承载，None 表示不限制
+    #  - 租户实际用量 = 该租户自身及其名下子用户所拥有知识库的文档大小之和
+    #  - super_admin（平台方）为 None（不限制）；普通子用户继承所属租户配额
+    storage_quota = Column(BigInteger, nullable=True)
     # 最近登录时间
     last_login_at = Column(DateTime, nullable=True)
 
@@ -67,6 +73,7 @@ class UserDB(Base):
             "is_verified": self.is_verified,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "storage_quota": self.storage_quota,
             "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
         }
 

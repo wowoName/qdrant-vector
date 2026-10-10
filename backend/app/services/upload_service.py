@@ -16,6 +16,7 @@ from app.core.exceptions import (
     UnsupportedFileTypeError,
 )
 from app.core.logging import get_logger
+from app.core.storage_quota import check_storage_quota
 from app.models.db.document import DocumentDB, DocumentVersionDB
 from app.models.db.upload import UploadSessionDB
 from app.models.schemas.document import (
@@ -45,7 +46,7 @@ class UploadService:
         """初始化分片上传"""
         # 校验 Collection
         coll_svc = CollectionService(self.db)
-        await coll_svc.get_by_id(req.collection_id)
+        collection = await coll_svc.get_by_id(req.collection_id)
 
         # 校验文件大小
         if req.file_size > settings.upload_max_file_size:
@@ -63,6 +64,18 @@ class UploadService:
             raise BadRequestError(
                 f"total_chunks mismatch: expected {expected_chunks}, got {req.total_chunks}"
             )
+
+        # 租户磁盘配额校验（大文件提前拦截，避免上传后才失败）
+        # 同目录同名文件为"替换"场景，仅计入增量占用
+        existing_doc = await self._find_existing_doc(
+            req.collection_id, req.directory_id, filename
+        )
+        add_bytes = (
+            max(0, req.file_size - (existing_doc.file_size or 0))
+            if existing_doc
+            else req.file_size
+        )
+        await check_storage_quota(self.db, collection.owner_user_id, add_bytes)
 
         # 创建上传会话
         upload_id = generate_id()
@@ -290,6 +303,21 @@ class UploadService:
             return None, None
 
         return doc, version
+
+    async def _find_existing_doc(
+        self, collection_id: str, directory_id: str | None, filename: str
+    ) -> DocumentDB | None:
+        """查找同 Collection 同目录下同名文档（用于替换场景的配额增量计算）"""
+        conditions = [
+            DocumentDB.collection_id == collection_id,
+            DocumentDB.name == filename,
+        ]
+        if directory_id:
+            conditions.append(DocumentDB.directory_id == directory_id)
+        else:
+            conditions.append(DocumentDB.directory_id.is_(None))
+        result = await self.db.execute(select(DocumentDB).where(*conditions))
+        return result.scalar_one_or_none()
 
     def _make_temp_dir(self, upload_id: str) -> str:
         """构造临时目录路径"""

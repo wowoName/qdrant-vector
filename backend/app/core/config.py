@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     # ---------- 存储配置 ----------
     storage_backend: str = "local"
     storage_root: str = "./data/storage"
+    # 可分配配额上限占磁盘总容量的比例（默认 0.7 = 70%）
+    # 用于：租户配额分配封顶、后台改配额超售校验、磁盘管理页展示的"可分配上限"
+    storage_allocatable_ratio: float = 0.7
 
     # S3 配置（可选）
     s3_endpoint: str | None = None
@@ -311,6 +314,10 @@ class Settings(BaseSettings):
     # JWT 配置
     jwt_algorithm: str = "HS256"
     jwt_expire_days: int = 7
+    # 租户默认磁盘配额（MB）：新租户注册时的默认可用空间，超管可按租户调整
+    tenant_default_quota_mb: int = 10
+    # 新注册租户的试用有效期（天）：自注册租户的过期时间 = 注册时间 + 该天数
+    tenant_trial_days: int = 7
     # 邮箱验证码有效期（分钟）
     email_code_expire_minutes: int = 10
     # 邮件验证码发送间隔（秒，防刷）

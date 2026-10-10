@@ -20,10 +20,18 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, require_admin
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.exceptions import AuthError, ConflictError, NotFoundError, ValidationError
 from app.core.logging import get_logger
 from app.core.security import hash_password
+from app.core.storage_quota import (
+    check_quota_allocation,
+    get_allocatable_capacity,
+    get_disk_usage,
+    get_tenants_usage,
+    get_usage_map,
+)
 from app.models.db.user import UserDB
 from app.models.schemas.common import paginated, success
 
@@ -43,7 +51,7 @@ class AdminCreateUserRequest(BaseModel):
 
 
 class AdminUpdateUserRequest(BaseModel):
-    """管理员更新他人：只能设置过期日期与状态（名称/密码由用户自行修改）
+    """管理员更新他人：只能设置过期日期、状态与存储配额（名称/密码由用户自行修改）
 
     extra="forbid"：显式拒绝 nickname/password/role 等越权字段，避免静默忽略
     """
@@ -51,6 +59,9 @@ class AdminUpdateUserRequest(BaseModel):
 
     expires_at: datetime | None = Field(None, description="过期日期，空表示永不过期")
     status: str | None = Field(None, pattern="^(active|disabled)$")
+    storage_quota: int | None = Field(
+        None, ge=0, description="存储配额（字节），仅总管理员可设置，null 表示不限制"
+    )
 
 
 # ---------- 工具 ----------
@@ -195,7 +206,21 @@ async def user_tree(
     for c in children:
         by_owner.setdefault(c.owner_admin_id, []).append(c)
 
-    # 3) 过滤（命中子用户则保留其父节点）
+    # 3) 存储用量：按租户（含名下子用户）汇总已用空间
+    all_ids = [o.id for o in owners] + [c.id for c in children]
+    usage_map = await get_usage_map(db, all_ids)
+
+    def _storage_of(owner: UserDB) -> dict:
+        member_ids = [owner.id, *[k.id for k in by_owner.get(owner.id, [])]]
+        used = sum(usage_map.get(i, 0) for i in member_ids)
+        unlimited = owner.role == "super_admin" or owner.storage_quota is None
+        return {
+            "storage_quota": owner.storage_quota,
+            "storage_used": used,
+            "storage_unlimited": unlimited,
+        }
+
+    # 4) 过滤（命中子用户则保留其父节点）
     kw = keyword.strip().lower() if keyword else None
     filtering = bool(
         kw or status or created_from or created_to or expires_from or expires_to
@@ -219,6 +244,7 @@ async def user_tree(
 
     def _node(u: UserDB, kids: list[UserDB]) -> dict:
         data = u.to_dict()
+        data.update(_storage_of(u))
         data["children"] = [{**k.to_dict(), "children": []} for k in kids]
         return data
 
@@ -268,27 +294,39 @@ async def create_user(
     return success(user.to_dict(), message="用户创建成功")
 
 
-@router.patch("/users/{user_id}", summary="更新用户（仅过期日期/状态）")
+@router.patch("/users/{user_id}", summary="更新用户（过期日期/状态/存储配额）")
 async def update_user(
     user_id: str,
     req: AdminUpdateUserRequest,
     admin: UserDB = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """管理员更新他人：只能设置过期日期与状态（名称/密码由用户自行在「个人信息」修改）"""
+    """管理员更新他人：只能设置过期日期、状态与存储配额（名称/密码由用户自行在「个人信息」修改）"""
     require_admin(admin)
 
     # 过期日期只有总管理员可设置（租户只能改状态）
     if "expires_at" in req.model_fields_set and admin.role != "super_admin":
         raise AuthError(message="只有总管理员可以设置过期日期", status_code=403)
+    # 存储配额只有总管理员可分配
+    if "storage_quota" in req.model_fields_set and admin.role != "super_admin":
+        raise AuthError(message="只有总管理员可以分配存储空间", status_code=403)
 
     user = await _get_managed_user(db, admin, user_id)
+
+    if "storage_quota" in req.model_fields_set and user.role != "tenant_admin":
+        raise ValidationError(message="存储空间仅可分配给租户管理员")
+
+    # 校验分配后总配额不超过物理磁盘容量（避免超售）
+    if "storage_quota" in req.model_fields_set:
+        await check_quota_allocation(db, req.storage_quota, exclude_user_id=user.id)
 
     # 使用 model_fields_set 区分"未提供该字段"（跳过）和"显式传 null"（清除）
     if "expires_at" in req.model_fields_set:
         user.expires_at = req.expires_at
     if req.status is not None:
         user.status = req.status
+    if "storage_quota" in req.model_fields_set:
+        user.storage_quota = req.storage_quota
 
     await db.flush()
     logger.info(f"Admin {admin.email} ({admin.role}) updated user {user.email}")
@@ -308,3 +346,53 @@ async def delete_user(
     await db.delete(user)
     logger.info(f"Admin {admin.email} ({admin.role}) deleted user {email}")
     return success({"deleted": True}, message="用户已删除")
+
+
+@router.get("/disk", summary="磁盘管理（总容量与各租户用量）")
+async def disk_overview(
+    admin: UserDB = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """磁盘管理总览
+
+    - disk：存储目录所在物理磁盘的容量（总量/已用/可用）
+    - summary：租户数、配额总量、实际用量、文档数
+    - tenants：各租户（含平台方）用量明细
+      - super_admin：查看全部租户
+      - tenant_admin：仅查看自身
+    """
+    require_admin(admin)
+
+    owner_id = admin.id if admin.role == "tenant_admin" else None
+    tenants = await get_tenants_usage(db, owner_id=owner_id)
+    disk = get_disk_usage(settings.storage_root)
+
+    # 配额统计仅纳入有限额租户（不限制的租户不计入配额总量，但其用量仍计入实际用量）
+    limited = [t for t in tenants if not t["unlimited"]]
+    total_quota = sum(t["quota"] or 0 for t in limited)
+    limited_used = sum(t["used"] for t in limited)
+    disk_total = disk.get("total", 0)
+    # 可分配配额上限 = 磁盘总容量 × 可分配比例（默认 70%）
+    allocatable_capacity = get_allocatable_capacity(disk_total)
+    summary = {
+        "tenant_count": len(tenants),
+        "unlimited_count": len(tenants) - len(limited),
+        "total_quota": total_quota,
+        "total_used": sum(t["used"] for t in tenants),
+        "total_documents": sum(t["document_count"] for t in tenants),
+        "quota_used_percent": round(limited_used / total_quota * 100, 1) if total_quota else 0.0,
+        # 可分配配额上限（磁盘总容量 × 比例）与剩余可分配
+        "allocatable_capacity": allocatable_capacity,
+        "allocatable_ratio": settings.storage_allocatable_ratio,
+        "allocatable_remaining": max(0, allocatable_capacity - total_quota) if allocatable_capacity else 0,
+        # 是否超售：已分配配额超过可分配上限
+        "overcommit": bool(allocatable_capacity) and total_quota > allocatable_capacity,
+    }
+
+    return success(
+        {
+            "disk": disk,
+            "summary": summary,
+            "tenants": tenants,
+        }
+    )

@@ -9,6 +9,8 @@ PostgreSQL 专用：表结构变更直接使用 ALTER TABLE。
 - v3: email_codes 增加 failed_attempts（防暴力破解）
 - v4: 用户角色 admin → super_admin（三级层级）
 - v5: tasks 增加 user_id 并回填归属（SaaS 隔离）
+- v6: users 增加 storage_quota 并回填默认租户配额（租户磁盘空间限制）
+- v7: users 增加 register_ip（限制同一 IP 只能注册一个租户）
 """
 
 from __future__ import annotations
@@ -231,6 +233,88 @@ async def migration_v5_task_user_id(engine, db_url: str) -> bool:
     return added
 
 
+# ---------- 迁移 v6：users 增加 storage_quota（租户磁盘空间限制） ----------
+
+async def migration_v6_user_storage_quota(engine, db_url: str) -> bool:
+    """迁移 v6: users 表增加 storage_quota 列并回填默认配额
+
+    - 新增 storage_quota 列（字节，可空）
+    - 已有租户（tenant_admin）与普通用户回填默认配额（由配置 tenant_default_quota_mb 决定）
+    - super_admin（平台方）保持 NULL，表示不限制
+    """
+    table_exists = await _table_exists_async(engine, "users")
+    if not table_exists:
+        return False
+
+    from sqlalchemy import inspect
+
+    def _has_col(sync_conn):
+        insp = inspect(sync_conn)
+        cols = [c["name"] for c in insp.get_columns("users")]
+        return "storage_quota" in cols
+
+    async with engine.begin() as conn:
+        has = await conn.run_sync(_has_col)
+    if has:
+        return False
+
+    print("[migration v6] Adding users.storage_quota...")
+
+    from app.core.config import settings
+
+    default_quota = settings.tenant_default_quota_mb * 1024 * 1024
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql("ALTER TABLE users ADD COLUMN storage_quota BIGINT")
+        # 已有租户与普通用户回填默认配额；super_admin 保持 NULL（不限制）
+        await conn.exec_driver_sql(
+            "UPDATE users SET storage_quota = "
+            f"{int(default_quota)} "
+            "WHERE role IN ('tenant_admin', 'user') AND storage_quota IS NULL"
+        )
+
+    print("[migration v6] Done.")
+    return True
+
+
+# ---------- 迁移 v7：users 增加 register_ip（限制同一 IP 只能注册一个租户） ----------
+
+async def migration_v7_user_register_ip(engine, db_url: str) -> bool:
+    """迁移 v7: users 表增加 register_ip 列（记录注册来源 IP）
+
+    历史数据无法追溯来源 IP，保持 NULL（不纳入同 IP 限制）。
+    """
+    table_exists = await _table_exists_async(engine, "users")
+    if not table_exists:
+        return False
+
+    from sqlalchemy import inspect
+
+    def _has_col(sync_conn):
+        insp = inspect(sync_conn)
+        cols = [c["name"] for c in insp.get_columns("users")]
+        return "register_ip" in cols
+
+    async with engine.begin() as conn:
+        has = await conn.run_sync(_has_col)
+    if has:
+        return False
+
+    print("[migration v7] Adding users.register_ip...")
+
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql("ALTER TABLE users ADD COLUMN register_ip VARCHAR(64)")
+        try:
+            await conn.exec_driver_sql(
+                "CREATE INDEX ix_users_register_ip ON users (register_ip)"
+            )
+        except Exception:
+            # 索引已存在或创建失败不影响主流程
+            pass
+
+    print("[migration v7] Done.")
+    return True
+
+
 # ---------- 迁移注册表 ----------
 # 每个迁移签名: (name, async_fn(engine, db_url) -> bool)
 
@@ -240,6 +324,8 @@ MIGRATIONS: list[tuple[str, Callable]] = [
     ("v3_email_code_failed_attempts", migration_v3_email_code_attempts),
     ("v4_user_roles_hierarchy", migration_v4_user_roles_hierarchy),
     ("v5_task_user_id", migration_v5_task_user_id),
+    ("v6_user_storage_quota", migration_v6_user_storage_quota),
+    ("v7_user_register_ip", migration_v7_user_register_ip),
 ]
 
 

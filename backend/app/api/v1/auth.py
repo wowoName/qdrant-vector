@@ -11,7 +11,7 @@ Auth API - 认证接口（SaaS）
 import re
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +22,12 @@ from app.core.database import get_db
 from app.core.email_service import generate_code, send_code_email, smtp_configured
 from app.core.logging import get_logger
 from app.core.security import create_access_token, hash_password, verify_password
+from app.core.storage_quota import (
+    DEFAULT_TENANT_QUOTA_BYTES,
+    compute_allocatable_quota,
+    format_bytes,
+    get_storage_info,
+)
 from app.models.db.user import EmailCodeDB, UserDB
 from app.models.schemas.common import success
 
@@ -92,8 +98,25 @@ async def _get_super_admin_id(db: AsyncSession) -> str | None:
     return result.scalar_one_or_none()
 
 
+def _client_ip(request: Request) -> str:
+    """获取客户端真实 IP（优先取反向代理的 X-Forwarded-For 首个地址）"""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else ""
+
+
 def _issue_token(user: UserDB) -> str:
     return create_access_token(user.id, user.role)
+
+
+async def _user_payload(db: AsyncSession, user: UserDB) -> dict:
+    """用户信息 + 所属租户存储配额/已用空间（供前端展示）"""
+    data = user.to_dict()
+    data.update(await get_storage_info(db, user))
+    return data
 
 
 # ---------- 接口 ----------
@@ -167,6 +190,7 @@ async def send_code(
 @router.post("/register", summary="注册用户（需邮箱验证码）")
 async def register(
     req: RegisterRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     from app.core.exceptions import BadRequestError, ConflictError
@@ -211,6 +235,44 @@ async def register(
     is_first = (any_user.scalar() or 0) == 0
     owner_admin_id = None if is_first else await _get_super_admin_id(db)
 
+    # 同一 IP 仅允许注册一个租户（总管理员为平台方，不受该限制）
+    client_ip = _client_ip(request)
+    if not is_first and client_ip:
+        ip_exists = await db.execute(
+            select(UserDB.id)
+            .where(
+                UserDB.role == "tenant_admin",
+                UserDB.register_ip == client_ip,
+            )
+            .limit(1)
+        )
+        if ip_exists.scalar_one_or_none():
+            raise ConflictError(message="该 IP 已注册过租户，同一 IP 仅允许注册一个租户")
+
+    # 新租户配额：首个注册者为总管理员（不限制）；其余按默认值分配，
+    # 但不超过磁盘可分配上限的剩余量（注册始终成功，空间不足时置 0 并提示用户联系管理员）
+    quota_warning: str | None = None
+    if is_first:
+        storage_quota = None
+    else:
+        storage_quota = await compute_allocatable_quota(db, DEFAULT_TENANT_QUOTA_BYTES)
+        if storage_quota < DEFAULT_TENANT_QUOTA_BYTES:
+            logger.warning(
+                f"Tenant quota capped for {email}: granted {storage_quota} bytes "
+                f"(default {DEFAULT_TENANT_QUOTA_BYTES}, allocatable headroom limited)"
+            )
+            if storage_quota <= 0:
+                quota_warning = (
+                    "当前系统可分配磁盘空间不足，暂未为您的账号分配存储空间，"
+                    "请联系管理员分配后再上传文件。"
+                )
+            else:
+                quota_warning = (
+                    f"当前系统可分配磁盘空间不足，已为您分配 {format_bytes(storage_quota)}"
+                    f"（低于默认 {format_bytes(DEFAULT_TENANT_QUOTA_BYTES)}），"
+                    "如需更多存储空间请联系管理员分配。"
+                )
+
     user = UserDB(
         email=email,
         password_hash=hash_password(req.password),
@@ -219,15 +281,24 @@ async def register(
         owner_admin_id=owner_admin_id,
         status="active",
         is_verified=True,
+        storage_quota=storage_quota,
+        # 自注册租户试用有效期：注册时间 + tenant_trial_days（总管理员不限制）
+        expires_at=None
+        if is_first
+        else datetime.utcnow() + timedelta(days=settings.tenant_trial_days),
+        register_ip=client_ip or None,
     )
     db.add(user)
     await db.flush()
 
-    logger.info(f"User registered: {email} (role={user.role}, first={is_first})")
-    return success(
-        {"token": _issue_token(user), "user": user.to_dict()},
-        message="注册成功",
+    logger.info(
+        f"User registered: {email} (role={user.role}, first={is_first}, ip={client_ip}, "
+        f"expires_at={user.expires_at})"
     )
+    data = {"token": _issue_token(user), "user": await _user_payload(db, user)}
+    if quota_warning:
+        data["quota_warning"] = quota_warning
+    return success(data, message="注册成功")
 
 
 @router.post("/login", summary="登录（返回 JWT）")
@@ -254,12 +325,15 @@ async def login(
     user.last_login_at = datetime.utcnow()
     await db.flush()
 
-    return success({"token": _issue_token(user), "user": user.to_dict()})
+    return success({"token": _issue_token(user), "user": await _user_payload(db, user)})
 
 
 @router.get("/me", summary="获取当前登录用户信息")
-async def me(user: UserDB = Depends(get_current_user)):
-    return success(user.to_dict())
+async def me(
+    user: UserDB = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return success(await _user_payload(db, user))
 
 
 @router.patch("/me", summary="修改当前用户信息（昵称/密码）")
@@ -287,4 +361,4 @@ async def update_me(
         user.password_hash = hash_password(req.password)
     await db.flush()
     logger.info(f"User {user.email} updated own profile")
-    return success(user.to_dict(), message="已更新")
+    return success(await _user_payload(db, user), message="已更新")

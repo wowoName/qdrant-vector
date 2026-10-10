@@ -152,6 +152,14 @@ class UnsupportedFileTypeError(BadRequestError):
         self.code = 40003
 
 
+class StorageQuotaExceededError(BadRequestError):
+    """存储空间不足（租户磁盘配额超限）"""
+
+    def __init__(self, message: str = "存储空间不足"):
+        super().__init__(message=message)
+        self.code = 40004
+
+
 class QdrantError(InternalError):
     """Qdrant 操作错误"""
 
