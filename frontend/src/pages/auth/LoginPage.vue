@@ -17,7 +17,7 @@
             <circle cx="24" cy="24" r="10.4" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1.3" />
           </svg>
         </div>
-        <h1>新页</h1>
+        <h1>{{ APP_NAME }}</h1>
         <p>向量数据中枢 · 生产级向量数据库管理平台</p>
       </div>
 
@@ -57,6 +57,7 @@ import { ElMessage, FormInstance, FormRules } from 'element-plus'
 import { Message, Lock } from '@element-plus/icons-vue'
 import { login } from '@/api/auth'
 import { setAuth } from '@/utils/user'
+import { APP_NAME } from '@/config/app'
 
 const router = useRouter()
 const formRef = ref<FormInstance>()

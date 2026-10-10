@@ -37,7 +37,7 @@
               <circle cx="24" cy="24" r="10.4" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1.3" />
             </svg>
           </div>
-          <h1 class="hero-title">新页</h1>
+          <h1 class="hero-title">{{ APP_NAME }}</h1>
           <p class="hero-sub">向量知识库智能助手 · 基于检索增强生成，回答可溯源</p>
 
           <div class="hero-cards">
@@ -84,7 +84,7 @@
               <!-- AI 消息 -->
               <template v-else>
                 <div class="msg-head">
-                  <span class="who">AI 助手</span>
+                  <span class="who">小叶</span>
                   <span v-if="msg.latency" class="meta-dot">{{ msg.latency }}ms</span>
                   <span v-if="msg.model" class="meta-dot">{{ msg.model }}</span>
                   <span v-if="msg.isCommand" class="meta-tag">系统消息</span>
@@ -313,6 +313,7 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import aiLoading from '@/assets/images/ai_loading.gif'
 import {
   ChatDotRound,
   User,
@@ -338,6 +339,7 @@ import {
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import { useChatStore, type ChatMessage } from '@/stores/chat'
+import { APP_NAME } from '@/config/app'
 
 marked.setOptions({ breaks: true, gfm: true })
 

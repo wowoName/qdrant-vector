@@ -34,7 +34,7 @@
           </svg>
         </div>
         <div class="brand-text">
-          <span class="brand-name">新页</span>
+          <span class="brand-name">{{ APP_NAME }}</span>
           <span class="brand-sub">向量数据中枢</span>
         </div>
       </div>
@@ -222,6 +222,7 @@ import { deleteConversation, type Conversation } from '@/api/chat'
 import { clearAuth, getUser, isAdmin as isAdminFn, roleLabel as getRoleLabel, setUser } from '@/utils/user'
 import { updateMe } from '@/api/auth'
 import { useChatStore } from '@/stores/chat'
+import { APP_NAME } from '@/config/app'
 
 const route = useRoute()
 const router = useRouter()

@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory, RouteRecordRaw } from 'vue-router'
 import { isLoggedIn, getUser } from '@/utils/user'
+import { APP_NAME } from '@/config/app'
 
 const routes: RouteRecordRaw[] = [
   // 认证页（无需登录）
@@ -76,7 +77,7 @@ const router = createRouter({
 router.beforeEach((to, _from, next) => {
   const title = to.meta?.title as string | undefined
   if (title) {
-    document.title = `${title} - 新页`
+    document.title = `${title} - ${APP_NAME}`
   }
 
   // 认证守卫：未登录跳转登录页

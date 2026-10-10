@@ -18,7 +18,7 @@
           </svg>
         </div>
         <h1>创建账号</h1>
-        <p>使用邮箱验证码注册 新页</p>
+        <p>使用邮箱验证码注册 {{ APP_NAME }}</p>
       </div>
 
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top" size="large">
@@ -91,6 +91,7 @@ import { ElMessage, FormInstance, FormRules } from 'element-plus'
 import { Message, Lock } from '@element-plus/icons-vue'
 import { register, sendCode } from '@/api/auth'
 import { setAuth } from '@/utils/user'
+import { APP_NAME } from '@/config/app'
 
 const router = useRouter()
 const formRef = ref<FormInstance>()
