@@ -1,0 +1,15 @@
+# 构建上下文不需要的文件
+node_modules/
+dist/
+dist-ssr/
+
+# IDE / 缓存 / 日志
+.vscode/
+.idea/
+*.log
+npm-debug.log*
+.pnpm-store/
+
+# Docker 自身
+Dockerfile
+.dockerignore

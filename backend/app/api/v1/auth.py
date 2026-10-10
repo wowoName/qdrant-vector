@@ -9,7 +9,7 @@ Auth API - 认证接口（SaaS）
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -30,6 +30,7 @@ from app.core.storage_quota import (
 )
 from app.models.db.user import EmailCodeDB, UserDB
 from app.models.schemas.common import success
+from app.utils.datetime_utils import now
 
 logger = get_logger(__name__)
 
@@ -137,7 +138,7 @@ async def send_code(
         raise ConflictError(message="该邮箱已注册")
 
     # 防刷：限制发送间隔
-    resend_limit = datetime.utcnow() - timedelta(seconds=settings.email_code_resend_seconds)
+    resend_limit = now() - timedelta(seconds=settings.email_code_resend_seconds)
     recent = await db.execute(
         select(func.count(EmailCodeDB.id)).where(
             EmailCodeDB.email == email,
@@ -153,7 +154,7 @@ async def send_code(
         )
 
     code = generate_code()
-    expire_at = datetime.utcnow() + timedelta(minutes=settings.email_code_expire_minutes)
+    expire_at = now() + timedelta(minutes=settings.email_code_expire_minutes)
 
     db.add(EmailCodeDB(email=email, code=code, purpose="register", expires_at=expire_at))
     await db.flush()
@@ -216,7 +217,7 @@ async def register(
     code_record = result.scalar_one_or_none()
     if not code_record:
         raise BadRequestError(message="请先获取邮箱验证码")
-    if code_record.expires_at <= datetime.utcnow():
+    if code_record.expires_at <= now():
         raise BadRequestError(message="验证码已过期，请重新获取")
     if code_record.code != req.code.strip():
         code_record.failed_attempts += 1
@@ -285,7 +286,7 @@ async def register(
         # 自注册租户试用有效期：注册时间 + tenant_trial_days（总管理员不限制）
         expires_at=None
         if is_first
-        else datetime.utcnow() + timedelta(days=settings.tenant_trial_days),
+        else now() + timedelta(days=settings.tenant_trial_days),
         register_ip=client_ip or None,
     )
     db.add(user)
@@ -322,7 +323,7 @@ async def login(
     if not user.is_verified:
         raise AuthError(message="邮箱未验证，请重新注册或联系管理员")
 
-    user.last_login_at = datetime.utcnow()
+    user.last_login_at = now()
     await db.flush()
 
     return success({"token": _issue_token(user), "user": await _user_payload(db, user)})

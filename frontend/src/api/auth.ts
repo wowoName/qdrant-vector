@@ -6,6 +6,8 @@ import type { UserInfo } from '@/utils/user'
 export interface LoginResponse {
   token: string
   user: UserInfo
+  /** 注册时若系统可分配磁盘空间不足，返回提示文案（提示用户联系管理员分配） */
+  quota_warning?: string
 }
 
 export interface SendCodeResponse {

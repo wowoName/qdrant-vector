@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     secret_key: str = "dev-secret-key"
     cors_origins: str = "*"
     workers: int = 1
+    # 应用时区：所有时间戳按此时区生成与展示（默认北京时间）
+    app_timezone: str = "Asia/Shanghai"
 
     # ---------- 主数据库配置（业务元数据：集合/文档/任务/上传 等） ----------
     # 统一使用 PostgreSQL（不再支持 SQLite）
@@ -139,8 +141,8 @@ class Settings(BaseSettings):
         # ---- 表格类：record 模式，一行一条结构化记录（支持 SmartQuery 精确查询）----
         "xlsx": {
             "strategy": "tabular",
-            "mode": "record",           # record / row / row_group / column_group / sql
-            "rows_per_chunk": 10,       # row_group 模式下每组行数
+            "mode": "record",  # record / row / row_group / column_group / sql
+            "rows_per_chunk": 10,  # row_group 模式下每组行数
             "include_headers": True,
         },
         "xls": {
@@ -391,6 +393,25 @@ class Settings(BaseSettings):
     smart_query_stream_synthesis: bool = True
     # 合成阶段是否注入对话历史（多轮上下文理解；关闭可回退到"无历史"行为）
     smart_query_use_history: bool = True
+    # 是否启用分组聚合排名（GROUP_AGG）：支持"哪个X的Y最多/Top N"这类维度分组聚合问题
+    # 关闭后相关问句回退到原有 TOP_N 行为（可快速回滚）
+    smart_query_group_agg_enabled: bool = True
+    # 是否由 LLM 主导查询规划：True=所有问句先由 LLM 产出计划（规则仅做校验/兜底）；
+    # False=回退到"规则优先 + LLM 兜底"的旧行为
+    smart_query_llm_first: bool = True
+    # 是否缓存查询计划（相同问句 + 相同表结构复用，省一次 LLM 规划）
+    smart_query_plan_cache_enabled: bool = True
+    # 是否启用多轮结构化范围继承：追问未重新指定范围时，自动沿用上一轮已解析的过滤条件
+    chat_scope_inheritance_enabled: bool = True
+    # 是否启用"状态解析 LLM"：判定本轮 operation（inherit/modify/remove_filter/reset_query）
+    # 关闭后仅用重置短语词典（规则）判定
+    chat_state_resolver_enabled: bool = True
+    # 是否启用"按需历史召回"：追问引用较早内容（继续/之前/刚才…）时，从最近窗口之外召回相关旧消息
+    chat_history_recall_enabled: bool = True
+    # 是否启用"跨会话长期用户记忆"：抽取并注入用户偏好/背景（记住/以后都/我们公司…）
+    chat_user_memory_enabled: bool = True
+    # 历史召回 / 长期记忆注入块的字符上限（与检索上下文共享 reserve 预算，避免撑爆上下文窗口）
+    chat_extra_context_max_chars: int = 1500
 
     @property
     def database_url(self) -> str:
@@ -480,4 +501,3 @@ def get_tabular_config(file_type: str | None = None) -> dict:
 
     result = {**base, **type_cfg}
     return result
-

@@ -9,11 +9,11 @@ export default defineConfig({
   ],
   theme: {
     colors: {
-      primary: '#3d7dff',
-      success: '#2fd39f',
-      warning: '#f0b24a',
-      danger: '#ff6b6b',
-      info: '#8a97b4',
+      primary: '#2563eb',
+      success: '#16a34a',
+      warning: '#d97706',
+      danger: '#dc2626',
+      info: '#7a8699',
     },
   },
   shortcuts: {

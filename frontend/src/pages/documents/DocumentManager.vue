@@ -9,7 +9,7 @@
     <!-- 拖拽覆盖层 -->
     <div v-if="isDragging && canWriteUser" class="drag-overlay">
       <div class="drag-overlay-content">
-        <el-icon :size="64" color="#409eff"><Upload /></el-icon>
+        <el-icon :size="64" color="#2563eb"><Upload /></el-icon>
         <p class="drag-text">松开鼠标上传文件到当前目录</p>
         <p class="drag-hint">支持 PDF、Word、Excel、PPT、图片、音视频等多种格式</p>
       </div>
@@ -183,9 +183,9 @@ import {
   Document, Picture, Grid, Reading, VideoCamera, Microphone,
   Files, Notebook,
 } from '@element-plus/icons-vue'
-import dayjs from 'dayjs'
+import { formatAppTime } from '@/utils/datetime'
 import request from '@/utils/request'
-import { canWrite } from '@/utils/user'
+import { canWrite, getUser } from '@/utils/user'
 import FilePreviewDrawer from '@/components/FilePreviewDrawer.vue'
 import UploadProgressDialog from '@/components/UploadProgressDialog.vue'
 
@@ -308,6 +308,7 @@ function processDroppedFiles(files: File[], directoryId: string) {
   })
 
   if (validFiles.length === 0) return
+  if (!checkStorageQuota(validFiles)) return
 
   pendingFiles.value = validFiles
   uploadDialogVisible.value = true
@@ -406,6 +407,12 @@ function handleFileSelect(event: Event) {
     return
   }
 
+  // 存储配额前置校验：空间不足直接提示，避免上传后失败
+  if (!checkStorageQuota(validFiles)) {
+    input.value = ''
+    return
+  }
+
   // 打开上传对话框并开始上传
   pendingFiles.value = validFiles
   uploadDialogVisible.value = true
@@ -413,6 +420,23 @@ function handleFileSelect(event: Event) {
 
   // 清空 input 以便下次选择相同文件能触发 change
   input.value = ''
+}
+
+/**
+ * 上传前校验当前租户剩余存储空间（本地缓存的用量为近似值，最终以后端校验为准）
+ */
+function checkStorageQuota(files: File[]): boolean {
+  const user = getUser()
+  if (!user || user.storage_unlimited || !user.storage_quota) return true
+  const total = files.reduce((sum, file) => sum + file.size, 0)
+  const remain = Math.max(0, user.storage_quota - (user.storage_used || 0))
+  if (total > remain) {
+    ElMessage.error(
+      `存储空间不足：剩余 ${formatSize(remain)}，本次需要 ${formatSize(total)}，请清理文件或联系管理员扩容`
+    )
+    return false
+  }
+  return true
 }
 
 function onUploadSuccess() {
@@ -540,7 +564,7 @@ function formatSize(bytes: number) {
 }
 
 function formatDate(date: string) {
-  return dayjs(date).format('YYYY-MM-DD HH:mm:ss')
+  return formatAppTime(date)
 }
 
 onMounted(() => {
@@ -565,8 +589,8 @@ onMounted(() => {
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: rgba(61, 125, 255, 0.16);
-  border: 4px dashed #3d7dff;
+  background-color: rgba(37, 99, 235, 0.08);
+  border: 4px dashed #2563eb;
   z-index: 9999;
   display: flex;
   align-items: center;
@@ -577,9 +601,9 @@ onMounted(() => {
 
 .drag-overlay-content {
   text-align: center;
-  background-color: rgba(14, 20, 36, 0.96);
-  border: 1px solid var(--vdm-border-strong);
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6), var(--vdm-glow);
+  background-color: #ffffff;
+  border: 1px solid var(--vdm-border);
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.14);
   padding: 48px 64px;
   border-radius: 18px;
 }
@@ -599,14 +623,14 @@ onMounted(() => {
 
 /* 目录面板拖拽高亮 */
 .panel-drag-over {
-  outline: 2px dashed #3d7dff;
+  outline: 2px dashed #2563eb;
   outline-offset: -2px;
   border-radius: 4px;
 }
 
 /* 树节点拖拽高亮 */
 .node-drag-over {
-  background-color: rgba(61, 125, 255, 0.24);
+  background-color: rgba(37, 99, 235, 0.14);
   border-radius: 4px;
   padding: 2px 4px;
   margin: -2px -4px;

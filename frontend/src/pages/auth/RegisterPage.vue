@@ -4,18 +4,7 @@
     <div class="auth-card">
       <div class="auth-logo">
         <div class="auth-mark">
-          <svg viewBox="0 0 48 48" width="28" height="28" aria-hidden="true">
-            <path
-              d="M24 4 41 14v20L24 44 7 34V14z"
-              fill="none"
-              stroke="#ffffff"
-              stroke-width="2.2"
-              stroke-linejoin="round"
-              opacity="0.92"
-            />
-            <circle cx="24" cy="24" r="5.2" fill="#ffffff" />
-            <circle cx="24" cy="24" r="10.4" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1.3" />
-          </svg>
+          <img :src="logoUrl" alt="系统 Logo" />
         </div>
         <h1>创建账号</h1>
         <p>使用邮箱验证码注册 {{ APP_NAME }}</p>
@@ -87,9 +76,10 @@
 <script setup lang="ts">
 import { onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, FormInstance, FormRules } from 'element-plus'
+import { ElMessage, ElMessageBox, FormInstance, FormRules } from 'element-plus'
 import { Message, Lock } from '@element-plus/icons-vue'
 import { register, sendCode } from '@/api/auth'
+import logoUrl from '@/assets/images/logo.jpg'
 import { setAuth } from '@/utils/user'
 import { APP_NAME } from '@/config/app'
 
@@ -180,6 +170,13 @@ async function handleRegister() {
       nickname: form.nickname.trim() || undefined,
     })
     setAuth(res.token, res.user)
+    // 可分配磁盘空间不足：注册成功但需提示用户联系管理员分配
+    if (res.quota_warning) {
+      await ElMessageBox.alert(res.quota_warning, '存储空间提示', {
+        type: 'warning',
+        confirmButtonText: '我知道了',
+      })
+    }
     ElMessage.success('注册成功')
     router.push('/chat')
   } catch {
@@ -208,10 +205,9 @@ async function handleRegister() {
   width: 440px;
   padding: 36px 38px 26px;
   border-radius: 22px;
-  background: rgba(14, 20, 36, 0.78);
-  border: 1px solid var(--vdm-border-strong);
-  backdrop-filter: blur(24px);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), var(--vdm-glow);
+  background: #ffffff;
+  border: 1px solid var(--vdm-border);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.1);
   animation: vdm-rise 0.5s ease both;
 }
 
@@ -224,10 +220,16 @@ async function handleRegister() {
   height: 54px;
   margin: 0 auto 13px;
   border-radius: 17px;
+  overflow: hidden;
   display: grid;
   place-items: center;
-  background: linear-gradient(135deg, #3d7dff, #22d3ee);
-  box-shadow: 0 0 40px rgba(61, 125, 255, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  box-shadow: 0 10px 26px rgba(37, 99, 235, 0.3);
+}
+.auth-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 .auth-logo h1 {
   margin: 0 0 6px;
@@ -235,10 +237,7 @@ async function handleRegister() {
   font-size: 19px;
   font-weight: 800;
   letter-spacing: 3px;
-  background: linear-gradient(100deg, #ffffff, #a9c6ff 50%, #22d3ee);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--vdm-text);
 }
 .auth-logo p {
   margin: 0;
@@ -261,11 +260,11 @@ async function handleRegister() {
   font-size: 15px;
   letter-spacing: 4px;
   border: none;
-  background: linear-gradient(135deg, #3d7dff, #22d3ee);
-  box-shadow: 0 12px 30px rgba(61, 125, 255, 0.45);
+  background: linear-gradient(135deg, #2563eb, #3b82f6);
+  box-shadow: 0 12px 26px rgba(37, 99, 235, 0.28);
 }
 .submit-btn:hover {
-  box-shadow: 0 16px 40px rgba(61, 125, 255, 0.6);
+  box-shadow: 0 16px 34px rgba(37, 99, 235, 0.38);
 }
 
 .auth-footer {
@@ -274,10 +273,10 @@ async function handleRegister() {
   color: var(--vdm-text-mute);
 }
 .auth-footer a {
-  color: #8fb6ff;
+  color: var(--vdm-accent);
   text-decoration: none;
 }
 .auth-footer a:hover {
-  color: #fff;
+  color: #1d4fd0;
 }
 </style>

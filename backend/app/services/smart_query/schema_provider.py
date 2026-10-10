@@ -17,13 +17,12 @@ SchemaProvider - 表结构提供器
 from __future__ import annotations
 
 import os
-import re
 import uuid
 from collections import OrderedDict
-from typing import Optional
 
 from app.core.logging import get_logger
-from .types import ColumnInfo, TableSchema, EntityInfo
+
+from .types import ColumnInfo, EntityInfo, TableSchema
 
 logger = get_logger(__name__)
 
@@ -59,7 +58,17 @@ HIERARCHY_KEYWORDS = {
 COLUMN_ALIASES = {
     "销售总监": ["总监", "销售总监", "负责人", "领导", "老大", "老板"],
     "特区经理": ["经理", "特区经理", "区域经理", "主管"],
-    "销售经理": ["销售经理", "销售人员", "销售代表", "销售", "人员", "业务员", "销售员", "经理"],
+    "销售经理": [
+        "销售经理",
+        "客户经理",
+        "销售人员",
+        "销售代表",
+        "销售",
+        "人员",
+        "业务员",
+        "销售员",
+        "经理",
+    ],
     "大区": ["大区", "区域", "销售大区", "销售区域"],
     "营销公司": ["公司", "营销公司", "分公司", "办事处"],
     "业务员": ["业务员", "销售人员", "销售代表", "销售", "人员"],
@@ -73,22 +82,58 @@ COLUMN_ALIASES = {
 
 # 数量/统计相关的关键词（用于识别统计类问题）
 COUNT_KEYWORDS = [
-    "多少", "几个", "数量", "总数", "总计", "合计", "统计", "有多少",
-    "多少个", "多少人", "多少名", "共多少", "总共有",
+    "多少",
+    "几个",
+    "数量",
+    "总数",
+    "总计",
+    "合计",
+    "统计",
+    "有多少",
+    "多少个",
+    "多少人",
+    "多少名",
+    "共多少",
+    "总共有",
 ]
 
 LIST_KEYWORDS = [
-    "有哪些", "哪些", "列出", "列表", "名单", "明细", "详情",
-    "分别是", "都是谁", "都有谁", "包括哪些", "包含哪些",
+    "有哪些",
+    "哪些",
+    "列出",
+    "列表",
+    "名单",
+    "明细",
+    "详情",
+    "分别是",
+    "都是谁",
+    "都有谁",
+    "包括哪些",
+    "包含哪些",
 ]
 
 GROUP_KEYWORDS = [
-    "每个", "各个", "分别", "按", "分组", "每个...多少", "各有多少",
+    "每个",
+    "各个",
+    "分别",
+    "按",
+    "分组",
+    "每个...多少",
+    "各有多少",
 ]
 
 TOP_KEYWORDS = [
-    "top", "前", "排名", "最高", "最多", "最大", "第一名", "前三",
-    "前十", "前10", "前20",
+    "top",
+    "前",
+    "排名",
+    "最高",
+    "最多",
+    "最大",
+    "第一名",
+    "前三",
+    "前十",
+    "前10",
+    "前20",
 ]
 
 
@@ -150,7 +195,7 @@ class SchemaProvider:
         file_path: str,
         sheet_name: str = "",
         threshold: float = 0.6,
-    ) -> Optional[EntityInfo]:
+    ) -> EntityInfo | None:
         """
         在实体字典中查找指定名称的实体
 
@@ -176,7 +221,7 @@ class SchemaProvider:
 
         # 包含匹配（用户输入是实体名的子串，或实体名是用户输入的子串）
         # 取最长匹配优先，避免短实体误匹配（如"华东"优先于"华"）
-        best_match: Optional[EntityInfo] = None
+        best_match: EntityInfo | None = None
         best_score = 0.0
 
         for ent in entities:
@@ -210,7 +255,7 @@ class SchemaProvider:
 
         return best_match
 
-    def match_column(self, keyword: str, schema: TableSchema) -> Optional[ColumnInfo]:
+    def match_column(self, keyword: str, schema: TableSchema) -> ColumnInfo | None:
         """
         根据关键词匹配列
 
@@ -263,7 +308,7 @@ class SchemaProvider:
 
         return chain
 
-    def get_table_name(self, file_path: str, sheet_name: str = "") -> Optional[str]:
+    def get_table_name(self, file_path: str, sheet_name: str = "") -> str | None:
         """
         获取已加载的表名（如果已缓存）
 
@@ -420,7 +465,7 @@ class SchemaProvider:
                     samples = conn.execute(
                         f'SELECT DISTINCT "{col_name}" FROM {table_name} '
                         f'WHERE "{col_name}" IS NOT NULL '
-                        f'LIMIT 5'
+                        f"LIMIT 5"
                     ).fetchall()
                     col_info.sample_values = [str(r[0]) for r in samples if r[0] is not None]
                 except Exception:
@@ -462,7 +507,7 @@ class SchemaProvider:
                 values = conn.execute(
                     f'SELECT DISTINCT "{col.name}" FROM {table_name} '
                     f'WHERE "{col.name}" IS NOT NULL '
-                    f'AND TRIM(CAST("{col.name}" AS VARCHAR)) != \'\''
+                    f"AND TRIM(CAST(\"{col.name}\" AS VARCHAR)) != ''"
                 ).fetchall()
 
                 for row in values:
@@ -530,13 +575,34 @@ class SchemaProvider:
         # 启发式：如果列名包含"公司/部门/组/员/经理/总监/区域/大区"等词，
         # 且当前层级数较少，则视为层级列
         hierarchy_indicators = [
-            "总监", "经理", "主管", "大区", "区域", "公司",
-            "办事处", "部门", "组", "业务员", "销售", "客户",
-            "专员", "主任", "负责人",
+            "总监",
+            "经理",
+            "主管",
+            "大区",
+            "区域",
+            "公司",
+            "办事处",
+            "部门",
+            "组",
+            "业务员",
+            "销售",
+            "客户",
+            "专员",
+            "主任",
+            "负责人",
             # 人员相关（经常被查询的维度）
-            "姓名", "员工", "人员", "员工编号", "工号", "雇员",
+            "姓名",
+            "员工",
+            "人员",
+            "员工编号",
+            "工号",
+            "雇员",
             # 常见业务维度
-            "产品", "商品", "物料", "项目", "渠道",
+            "产品",
+            "商品",
+            "物料",
+            "项目",
+            "渠道",
         ]
 
         for indicator in hierarchy_indicators:
@@ -555,17 +621,14 @@ class SchemaProvider:
             if col_normalized == self._normalize_text(std_name):
                 aliases.extend(alias_list)
                 break
-            if any(
-                col_normalized == self._normalize_text(a)
-                for a in alias_list
-            ):
+            if any(col_normalized == self._normalize_text(a) for a in alias_list):
                 aliases.append(std_name)
                 aliases.extend([a for a in alias_list if a != col_name])
                 break
 
         return list(set(aliases))
 
-    def _normalize_text(self, value: Optional[str]) -> str:
+    def _normalize_text(self, value: str | None) -> str:
         """标准化文本：去空格、统一全角半角、小写"""
         if value is None:
             return ""

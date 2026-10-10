@@ -11,6 +11,8 @@ PostgreSQL 专用：表结构变更直接使用 ALTER TABLE。
 - v5: tasks 增加 user_id 并回填归属（SaaS 隔离）
 - v6: users 增加 storage_quota 并回填默认租户配额（租户磁盘空间限制）
 - v7: users 增加 register_ip（限制同一 IP 只能注册一个租户）
+- v8: conversations 增加 state_json（结构化会话状态）
+- v9: 历史 UTC 时间戳统一平移为北京时间（+8h，一次性；由标记表保证幂等）
 """
 
 from __future__ import annotations
@@ -315,6 +317,126 @@ async def migration_v7_user_register_ip(engine, db_url: str) -> bool:
     return True
 
 
+# ---------- 迁移 v8：conversations 增加 state_json（结构化会话状态） ----------
+
+async def migration_v8_conversation_state(engine, db_url: str) -> bool:
+    """迁移 v8: conversations 表增加 state_json 列（多轮范围继承的结构化状态）"""
+    table_exists = await _table_exists_async(engine, "conversations")
+    if not table_exists:
+        return False
+
+    from sqlalchemy import inspect
+
+    def _has_col(sync_conn):
+        insp = inspect(sync_conn)
+        cols = [c["name"] for c in insp.get_columns("conversations")]
+        return "state_json" in cols
+
+    async with engine.begin() as conn:
+        has = await conn.run_sync(_has_col)
+    if has:
+        return False
+
+    print("[migration v8] Adding conversations.state_json...")
+
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "ALTER TABLE conversations ADD COLUMN state_json TEXT"
+        )
+
+    print("[migration v8] Done.")
+    return True
+
+
+# ---------- 迁移 v9：历史 UTC 时间戳平移为北京时间（+8h，一次性） ----------
+
+async def migration_v9_beijing_time_shift(engine, db_url: str) -> bool:
+    """迁移 v9: 将历史 UTC 时间戳统一平移为北京时间
+
+    旧版本所有时间字段以 UTC 存储，而应用层/前端按本地（北京）时间展示，
+    导致历史记录整体早 8 小时。本迁移把已有数据整体平移 UTC→应用时区的偏移量，
+    与新代码"应用层统一生成北京时间"保持一致。
+
+    幂等保障：数据平移无法通过结构自检判断，故使用 _schema_migration_marks
+    标记表记录执行状态，保证每个库只执行一次（主库 / 对话库各自独立标记）。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from sqlalchemy import inspect
+
+    from app.core.config import settings
+
+    mark = "v9_beijing_time_shift"
+    # 需要平移的表 -> 时间列（email_codes 为短时效验证码，为避免延长已失效验证码有效期，不参与平移）
+    targets: dict[str, list[str]] = {
+        "conversations": ["created_at", "updated_at"],
+        "messages": ["created_at"],
+        "conversation_summaries": ["created_at", "updated_at"],
+        "user_memories": ["created_at", "updated_at"],
+        "users": ["created_at", "expires_at", "last_login_at"],
+        "upload_sessions": ["created_at", "updated_at", "expires_at"],
+        "directories": ["created_at", "updated_at"],
+        "collections": ["created_at", "updated_at"],
+        "tasks": ["created_at", "updated_at", "started_at", "completed_at"],
+        "documents": ["created_at", "updated_at"],
+        "document_versions": ["created_at"],
+        "chunks": ["created_at"],
+        "document_records": ["created_at"],
+    }
+
+    # 计算 UTC → 应用时区的偏移小时数（历史数据均为 UTC）
+    offset = datetime.now(ZoneInfo(settings.app_timezone)).utcoffset()
+    hours = offset.total_seconds() / 3600 if offset else 0.0
+
+    def _collect(sync_conn):
+        insp = inspect(sync_conn)
+        existing_tables = set(insp.get_table_names())
+        plan: dict[str, list[str]] = {}
+        for table, cols in targets.items():
+            if table not in existing_tables:
+                continue
+            present = {c["name"] for c in insp.get_columns(table)}
+            hit = [c for c in cols if c in present]
+            if hit:
+                plan[table] = hit
+        return plan
+
+    async with engine.begin() as conn:
+        # 标记表：记录一次性数据迁移，避免重复平移
+        await conn.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS _schema_migration_marks ("
+            "name VARCHAR(100) PRIMARY KEY, "
+            "applied_at TIMESTAMP DEFAULT now())"
+        )
+        marked = await conn.exec_driver_sql(
+            f"SELECT 1 FROM _schema_migration_marks WHERE name = '{mark}'"
+        )
+        if marked.first() is not None:
+            return False
+
+        if hours == 0:
+            await conn.exec_driver_sql(
+                f"INSERT INTO _schema_migration_marks (name) VALUES ('{mark}')"
+            )
+            return False
+
+        plan = await conn.run_sync(_collect)
+        print(f"[migration v9] Shifting historical timestamps by +{hours}h ...")
+        for table, cols in plan.items():
+            for col in cols:
+                await conn.exec_driver_sql(
+                    f'UPDATE "{table}" SET "{col}" = "{col}" + '
+                    f"INTERVAL '{hours} hours' WHERE \"{col}\" IS NOT NULL"
+                )
+        await conn.exec_driver_sql(
+            f"INSERT INTO _schema_migration_marks (name) VALUES ('{mark}')"
+        )
+
+    print(f"[migration v9] Done. Shifted tables: {list(plan.keys())}")
+    return True
+
+
 # ---------- 迁移注册表 ----------
 # 每个迁移签名: (name, async_fn(engine, db_url) -> bool)
 
@@ -326,6 +448,8 @@ MIGRATIONS: list[tuple[str, Callable]] = [
     ("v5_task_user_id", migration_v5_task_user_id),
     ("v6_user_storage_quota", migration_v6_user_storage_quota),
     ("v7_user_register_ip", migration_v7_user_register_ip),
+    ("v8_conversation_state_json", migration_v8_conversation_state),
+    ("v9_beijing_time_shift", migration_v9_beijing_time_shift),
 ]
 
 

@@ -13,11 +13,11 @@
 """
 
 import uuid
-from datetime import datetime
 
 from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, Index, String
 
 from app.core.database import Base
+from app.utils.datetime_utils import now
 
 
 class UserDB(Base):
@@ -41,7 +41,7 @@ class UserDB(Base):
     # 邮箱是否已验证
     is_verified = Column(Boolean, nullable=False, default=False)
     # 注册日期
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    created_at = Column(DateTime, default=now, nullable=False, index=True)
     # 注册来源 IP（用于限制同一 IP 只能注册一个租户）
     register_ip = Column(String(64), nullable=True, index=True)
     # 过期日期（None 表示永不过期），过期后禁止登录和使用
@@ -59,7 +59,7 @@ class UserDB(Base):
     def is_expired(self) -> bool:
         if self.expires_at is None:
             return False
-        return self.expires_at <= datetime.utcnow()
+        return self.expires_at <= now()
 
     def to_dict(self) -> dict:
         """转换为响应字典（不含密码哈希）"""
@@ -92,6 +92,6 @@ class EmailCodeDB(Base):
     used = Column(Boolean, nullable=False, default=False)
     # 失败尝试次数（超过 5 次后验证码失效，防暴力破解）
     failed_attempts = Column(Integer, nullable=False, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now, nullable=False)
 
     __table_args__ = (Index("idx_email_codes_email_purpose", "email", "purpose", "created_at"),)

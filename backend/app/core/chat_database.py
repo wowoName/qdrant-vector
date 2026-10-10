@@ -33,6 +33,7 @@ if _use_separate_chat_db:
         "max_overflow": settings.chat_db_max_overflow,
         "pool_recycle": settings.chat_db_pool_recycle,
         "pool_pre_ping": True,
+        "connect_args": {"server_settings": {"timezone": settings.app_timezone}},
     }
     chat_engine = create_async_engine(
         settings.chat_database_url,

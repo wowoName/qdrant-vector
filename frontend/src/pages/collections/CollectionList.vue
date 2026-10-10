@@ -27,7 +27,7 @@
         <el-table-column prop="name" label="名称" min-width="180">
           <template #default="{ row }">
             <div class="flex items-center gap-2">
-              <el-icon :size="18" color="#409eff"><CollectionIcon /></el-icon>
+              <el-icon :size="18" color="#2563eb"><CollectionIcon /></el-icon>
               <span class="font-medium cursor-pointer" @click="goToDocuments(row)">
                 {{ row.name }}
               </span>
@@ -118,7 +118,7 @@ import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'elem
 import { Plus, Search, Collection as CollectionIcon } from '@element-plus/icons-vue'
 import { getCollections, createCollection, deleteCollection, type Collection } from '@/api/collection'
 import { canWrite } from '@/utils/user'
-import dayjs from 'dayjs'
+import { formatAppTime } from '@/utils/datetime'
 
 const router = useRouter()
 const canWriteUser = computed(() => canWrite())
@@ -165,7 +165,7 @@ const rules: FormRules = {
 }
 
 function formatDate(date: string) {
-  return dayjs(date).format('YYYY-MM-DD HH:mm:ss')
+  return formatAppTime(date)
 }
 
 async function fetchData() {

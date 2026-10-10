@@ -116,30 +116,47 @@ class SynthesizerAgent:
 
         sink = self._delta_sink
         if sink is None:
-            return await llm.simple_chat(
+            text = await llm.simple_chat(
                 prompt=prompt,
                 system_prompt=system_prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+        else:
+            # 与 BaseLLM.simple_chat 完全一致的 messages 构造，保证输入相同
+            messages: list[ChatMessage] = []
+            if system_prompt:
+                messages.append(ChatMessage("system", system_prompt))
+            messages.append(ChatMessage("user", prompt))
 
-        # 与 BaseLLM.simple_chat 完全一致的 messages 构造，保证输入相同
-        messages: list[ChatMessage] = []
-        if system_prompt:
-            messages.append(ChatMessage("system", system_prompt))
-        messages.append(ChatMessage("user", prompt))
+            parts: list[str] = []
+            async for chunk in llm.chat_stream(
+                messages, temperature=temperature, max_tokens=max_tokens
+            ):
+                if chunk.get("type") != "content":
+                    continue
+                piece = chunk.get("content", "")
+                if piece:
+                    parts.append(piece)
+                    sink(piece)
+            text = "".join(parts)
 
-        parts: list[str] = []
-        async for chunk in llm.chat_stream(
-            messages, temperature=temperature, max_tokens=max_tokens
-        ):
-            if chunk.get("type") != "content":
-                continue
-            piece = chunk.get("content", "")
-            if piece:
-                parts.append(piece)
-                sink(piece)
-        return "".join(parts)
+        if text and text.strip():
+            return text
+
+        # 合成模型偶发返回空串（模型抖动）：重试一次，避免出现空白答案
+        logger.warning("LLM synthesis returned empty, retrying once")
+        try:
+            retry = await llm.simple_chat(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            logger.warning(f"LLM synthesis retry failed: {e}")
+            return text
+        return retry or text
 
     def _get_llm(self):
         """获取 LLM 实例（懒加载）"""
@@ -388,13 +405,17 @@ class SynthesizerAgent:
         return detail_hits
 
     def _collect_distinct_hits(self, sql_hits) -> list:
-        """从 SQL 命中中收集去重列表 hits（排除空标记）"""
+        """从 SQL 命中中收集去重列表 hits（排除空标记 / 聚合附带的度量值列表）"""
         distinct_hits = []
         for h in (sql_hits or []):
             payload = getattr(h, "payload", None) or {}
             if payload.get("type") != "distinct_list":
                 continue
             if payload.get("empty"):
+                continue
+            # 聚合查询（SUM/AVG）附带的"去重度量值"列表无展示/下载价值（如 47 个销售金额），
+            # 仅用于内部校验，不进入下载链接导出
+            if payload.get("from_aggregate_query"):
                 continue
             distinct_hits.append(h)
         return distinct_hits
@@ -584,6 +605,17 @@ class SynthesizerAgent:
             references = self._build_references_multi(multi_result, context)
             return answer, references
 
+        # 分组聚合排名（GROUP_AGG）：走确定性格式化，直接给出排名结果，
+        # 避免 LLM 误判为"没有汇总数据"而拒答。
+        if has_sql and any(
+            h.payload and h.payload.get("type") == "group_agg"
+            for h in multi_result.sql_hits
+        ):
+            answer = self._format_group_agg(multi_result.sql_hits, plan)
+            references = self._build_references_multi(multi_result, context)
+            # 排名结果已在正文完整给出（含 TopN / 分组总数），无需再附加明细下载链接
+            return answer, references
+
         # 属性定向问答：用户问的是"某实体的某属性"（如"胡兰桂在哪个部门"），
         # 直接回答该属性值，避免把整行明细 dump 成表格
         if has_sql and plan.projection_column:
@@ -632,6 +664,71 @@ class SynthesizerAgent:
         first = sql_hits[0]
         return first.payload.get("type") == "aggregate"
 
+    def _format_group_agg(self, sql_hits: list[RetrievalHit], plan: QueryPlan) -> str:
+        """格式化分组聚合排名结果（确定性输出，不依赖 LLM）
+
+        支持两种形态：
+        - 单值："哪个业务员销售的最多" → 直接给出最优分组及其聚合值
+        - 排名："销售额排名前三的业务员" → 有序排名列表
+        """
+        hits = [
+            h for h in sql_hits if h.payload and h.payload.get("type") == "group_agg"
+        ]
+        if not hits:
+            return "未找到相关结果。"
+
+        valid = [h for h in hits if not h.payload.get("empty")]
+        filter_desc = self._describe_filters(plan.filters)
+        scope = f"在{filter_desc}范围内，" if filter_desc else ""
+
+        # 空结果：明确告知"该范围内无数据"
+        if not valid:
+            p0 = hits[0].payload
+            dim = p0.get("group_column") or plan.group_by or "分组"
+            metric = p0.get("metric_column") or plan.metric_column
+            metric_desc = metric or "记录数"
+            return (
+                f"根据现有数据，{scope}没有可用于按「{dim}」统计{metric_desc}的记录。"
+            )
+
+        first = valid[0].payload
+        dim = first.get("group_column") or plan.group_by or "分组"
+        metric = first.get("metric_column") or plan.metric_column or ""
+        agg_func = first.get("agg_func") or plan.agg_func or "sum"
+        order_dir = (first.get("order_dir") or plan.order_dir or "DESC").upper()
+        total_groups = first.get("_total_groups")
+
+        op_label = {"sum": "合计", "avg": "平均", "count": "数量", "max": "最大", "min": "最小"}.get(
+            agg_func, "合计"
+        )
+        metric_desc = f"{metric}{op_label}" if metric else "记录数"
+        direction = "最少" if order_dir == "ASC" else "最多"
+
+        # 单值形态：只取到一个分组（limit=1）且无更多分组
+        if len(valid) == 1 and (plan.limit == 1 or total_groups in (None, 1)):
+            hp = valid[0].payload
+            return (
+                f"{scope}{metric_desc}{direction}的是「{hp.get('group_value')}」，"
+                f"{metric_desc}为 **{hp.get('value')}**。"
+            )
+
+        # 排名形态
+        lines = []
+        for h in valid:
+            hp = h.payload
+            lines.append(
+                f"{hp.get('rank', '-')}. 「{hp.get('group_value')}」 — {metric_desc} {hp.get('value')}"
+            )
+        shown = len(valid)
+        if total_groups and total_groups > shown:
+            header = (
+                f"{scope}按「{dim}」统计的{metric_desc}排名"
+                f"（前 {shown} 名 / 共 {total_groups} 个分组）：\n\n"
+            )
+        else:
+            header = f"{scope}按「{dim}」统计的{metric_desc}排名（共 {shown} 个）：\n\n"
+        return header + "\n".join(lines)
+
     async def _synthesize_multi_sql(
         self, query: str, plan: QueryPlan, multi_result: MultiRetrievalResult
     ) -> str:
@@ -652,7 +749,7 @@ class SynthesizerAgent:
                         prompt=f"用户问题：{query}",
                         system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context_text,
                         temperature=0.3,
-                        max_tokens=1024,
+                        max_tokens=2048,
                     )
                     return answer.strip()
                 except Exception as e:
@@ -703,6 +800,7 @@ class SynthesizerAgent:
             QueryOperation.COUNT, QueryOperation.SUM, QueryOperation.AVG,
             QueryOperation.LIST, QueryOperation.DETAIL,
             QueryOperation.TOP_N, QueryOperation.GROUP_COUNT,
+            QueryOperation.GROUP_AGG,
         )
         if (plan.operation in structured_ops
                 and multi_result.sql_hits and multi_result.sql_success
@@ -723,7 +821,7 @@ class SynthesizerAgent:
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context_text,
                 temperature=0.5,
-                max_tokens=1024,
+                max_tokens=2048,
             )
             return answer.strip()
 
@@ -747,7 +845,34 @@ class SynthesizerAgent:
         if multi_result.sql_hits:
             parts.append("## 精确数据（来自数据库）")
 
-            if is_multi_table:
+            # 分组聚合排名（已按维度分组汇总）——优先且排他展示
+            group_agg_hits = [
+                h for h in multi_result.sql_hits
+                if h.payload and h.payload.get("type") == "group_agg"
+            ]
+            if group_agg_hits:
+                valid = [h for h in group_agg_hits if not h.payload.get("empty")]
+                if valid:
+                    p0 = valid[0].payload
+                    dim = p0.get("group_column", "")
+                    metric = p0.get("metric_column", "")
+                    agg = p0.get("agg_func", "sum")
+                    op_label = {
+                        "sum": "合计", "avg": "平均", "count": "数量",
+                        "max": "最大", "min": "最小",
+                    }.get(agg, "合计")
+                    metric_desc = f"{metric}{op_label}" if metric else "记录数"
+                    parts.append(
+                        f"（以下为**已按「{dim}」分组汇总**的{metric_desc}排名，已按聚合值排序，"
+                        f"请直接据此给出排名结论，不要说没有汇总数据）"
+                    )
+                    for h in valid:
+                        hp = h.payload
+                        parts.append(f"{hp.get('rank', '-')}. {hp.get('group_value')} : {hp.get('value')}")
+                else:
+                    parts.append("该范围内没有匹配的分组数据。")
+                parts.append("")
+            elif is_multi_table:
                 # --- 多表场景：按来源表分组展示 ---
                 table_groups: dict[str, list] = {}
                 for h in multi_result.sql_hits:
@@ -925,16 +1050,40 @@ class SynthesizerAgent:
                 doc_name = context.debug_info.get("file_name", "")
                 doc_id = context.debug_info.get("document_id", "")
 
-            # 分离聚合 hit 和明细 hit
+            # 分离聚合 / 分组聚合 / 明细 hit
             agg_hit = None
+            group_agg_hits = []
             detail_hits = []
             for h in multi_result.sql_hits:
-                if h.payload and h.payload.get("type") == "aggregate":
+                htype = (h.payload or {}).get("type")
+                if htype == "aggregate":
                     agg_hit = h
+                elif htype == "group_agg":
+                    group_agg_hits.append(h)
                 else:
                     detail_hits.append(h)
 
-            if agg_hit:
+            if group_agg_hits:
+                # 分组聚合：汇总为一条排名说明引用
+                valid = [h for h in group_agg_hits if not h.payload.get("empty")]
+                if valid:
+                    p0 = valid[0].payload
+                    dim = p0.get("group_column", "")
+                    metric = p0.get("metric_column", "")
+                    text = "、".join(
+                        f"{h.payload.get('group_value')}={h.payload.get('value')}"
+                        for h in valid[:10]
+                    )
+                    references.append({
+                        "chunk_id": "sql_group_agg",
+                        "document_id": doc_id,
+                        "document_name": doc_name,
+                        "chunk_index": 0,
+                        "text": f"按「{dim}」分组的{metric or '记录数'}排名：{text}",
+                        "score": 1.0,
+                        "source_type": "sql",
+                    })
+            elif agg_hit:
                 val = agg_hit.payload.get("value", 0)
                 references.append({
                     "chunk_id": "sql_aggregate",
@@ -1212,7 +1361,7 @@ class SynthesizerAgent:
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context,
                 temperature=0.3,
-                max_tokens=800,
+                max_tokens=1200,
             )
 
             return answer.strip()
@@ -1228,6 +1377,18 @@ class SynthesizerAgent:
         operation = plan.operation.value
         target = plan.target_column_alias or plan.target_column or "结果"
 
+        # SUM / AVG 类（求和 / 平均）：直接给出一句话结论，不展示表格
+        if operation in ("sum", "avg") and sql_result.rows and len(sql_result.rows) > 0:
+            val = sql_result.get_single_value()
+            if val is not None:
+                filter_desc = self._describe_filters(plan.filters) if plan.filters else ""
+                op_label = "合计" if operation == "sum" else "平均值"
+                total = getattr(sql_result, "total_count", None)
+                cnt_desc = f"，共 {total} 条记录" if total else ""
+                if filter_desc:
+                    return f"根据数据，{filter_desc}的{target}{op_label}为 **{val}**{cnt_desc}。"
+                return f"根据数据，{target}{op_label}为 **{val}**{cnt_desc}。"
+
         # COUNT 类
         if operation == "count" and sql_result.rows and len(sql_result.rows) > 0:
             val = sql_result.get_single_value()
@@ -1239,7 +1400,8 @@ class SynthesizerAgent:
 
                 if detail_items:
                     # 有明细：总数 + 明细列表（超过上限时展示前 N 条，完整明细走下载链接）
-                    prefix = f"根据数据统计，{filter_desc}的{target}共有 **{val}** 个。\n\n明细列表：\n\n"
+                    scope = f"{filter_desc}的" if filter_desc else ""
+                    prefix = f"根据数据统计，{scope}{target}共有 **{val}** 个。\n\n明细列表：\n\n"
                     if len(detail_items) > self.DETAIL_INLINE_LIMIT:
                         list_text = "\n".join(
                             f"- {item}" for item in detail_items[: self.DETAIL_INLINE_LIMIT]
@@ -1349,7 +1511,7 @@ class SynthesizerAgent:
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n参考资料：\n" + context,
                 temperature=0.7,
-                max_tokens=1024,
+                max_tokens=2048,
             )
 
             return answer.strip()
@@ -1416,7 +1578,7 @@ class SynthesizerAgent:
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context,
                 temperature=0.5,
-                max_tokens=1024,
+                max_tokens=2048,
             )
 
             return answer.strip()

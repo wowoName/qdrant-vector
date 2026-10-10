@@ -4,18 +4,7 @@
     <div class="auth-card">
       <div class="auth-logo">
         <div class="auth-mark">
-          <svg viewBox="0 0 48 48" width="30" height="30" aria-hidden="true">
-            <path
-              d="M24 4 41 14v20L24 44 7 34V14z"
-              fill="none"
-              stroke="#ffffff"
-              stroke-width="2.2"
-              stroke-linejoin="round"
-              opacity="0.92"
-            />
-            <circle cx="24" cy="24" r="5.2" fill="#ffffff" />
-            <circle cx="24" cy="24" r="10.4" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1.3" />
-          </svg>
+          <img :src="logoUrl" alt="系统 Logo" />
         </div>
         <h1>{{ APP_NAME }}</h1>
         <p>向量数据中枢 · 生产级向量数据库管理平台</p>
@@ -56,10 +45,13 @@ import { useRouter } from 'vue-router'
 import { ElMessage, FormInstance, FormRules } from 'element-plus'
 import { Message, Lock } from '@element-plus/icons-vue'
 import { login } from '@/api/auth'
+import logoUrl from '@/assets/images/logo.jpg'
 import { setAuth } from '@/utils/user'
+import { useChatStore } from '@/stores/chat'
 import { APP_NAME } from '@/config/app'
 
 const router = useRouter()
+const chat = useChatStore()
 const formRef = ref<FormInstance>()
 const loading = ref(false)
 
@@ -83,6 +75,8 @@ async function handleLogin() {
   loading.value = true
   try {
     const res = await login({ email: form.email.trim(), password: form.password })
+    // 登录前先清空上一位用户残留的会话/知识库数据，避免侧边栏短暂显示他人记录
+    chat.clearUserData()
     setAuth(res.token, res.user)
     ElMessage.success('登录成功')
     router.push('/chat')
@@ -111,10 +105,9 @@ async function handleLogin() {
   width: 420px;
   padding: 40px 38px 30px;
   border-radius: 22px;
-  background: rgba(14, 20, 36, 0.78);
-  border: 1px solid var(--vdm-border-strong);
-  backdrop-filter: blur(24px);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), var(--vdm-glow);
+  background: #ffffff;
+  border: 1px solid var(--vdm-border);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.1);
   animation: vdm-rise 0.5s ease both;
 }
 
@@ -127,10 +120,16 @@ async function handleLogin() {
   height: 58px;
   margin: 0 auto 14px;
   border-radius: 18px;
+  overflow: hidden;
   display: grid;
   place-items: center;
-  background: linear-gradient(135deg, #3d7dff, #22d3ee);
-  box-shadow: 0 0 40px rgba(61, 125, 255, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  box-shadow: 0 10px 26px rgba(37, 99, 235, 0.3);
+}
+.auth-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 .auth-logo h1 {
   margin: 0 0 6px;
@@ -139,10 +138,7 @@ async function handleLogin() {
   font-weight: 800;
   letter-spacing: 10px;
   text-indent: 10px;
-  background: linear-gradient(100deg, #ffffff, #a9c6ff 50%, #22d3ee);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--vdm-text);
 }
 .auth-logo p {
   margin: 0;
@@ -156,11 +152,11 @@ async function handleLogin() {
   font-size: 15px;
   letter-spacing: 4px;
   border: none;
-  background: linear-gradient(135deg, #3d7dff, #22d3ee);
-  box-shadow: 0 12px 30px rgba(61, 125, 255, 0.45);
+  background: linear-gradient(135deg, #2563eb, #3b82f6);
+  box-shadow: 0 12px 26px rgba(37, 99, 235, 0.28);
 }
 .submit-btn:hover {
-  box-shadow: 0 16px 40px rgba(61, 125, 255, 0.6);
+  box-shadow: 0 16px 34px rgba(37, 99, 235, 0.38);
 }
 
 .auth-footer {
@@ -169,10 +165,10 @@ async function handleLogin() {
   color: var(--vdm-text-mute);
 }
 .auth-footer a {
-  color: #8fb6ff;
+  color: var(--vdm-accent);
   text-decoration: none;
 }
 .auth-footer a:hover {
-  color: #fff;
+  color: #1d4fd0;
 }
 </style>

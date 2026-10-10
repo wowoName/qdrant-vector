@@ -3,11 +3,11 @@ Task ORM 模型
 """
 
 import uuid
-from datetime import datetime
 
 from sqlalchemy import JSON, Column, DateTime, Float, Integer, String, Text
 
 from app.core.database import Base
+from app.utils.datetime_utils import now
 
 
 class TaskDB(Base):
@@ -31,5 +31,5 @@ class TaskDB(Base):
     max_retries = Column(Integer, default=3)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=now, index=True)
+    updated_at = Column(DateTime, default=now, onupdate=now)

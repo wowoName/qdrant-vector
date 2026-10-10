@@ -621,6 +621,7 @@ class ContextWindowManager:
         history_messages: list[dict],
         summaries: SummaryBundle,
         key_turn_seqs: list[int] | None = None,
+        extra_system_tokens: int = 0,
     ) -> ContextAssemblyResult:
         """组装发给模型的消息列表
 
@@ -630,6 +631,8 @@ class ContextWindowManager:
             history_messages: 历史消息列表（按 seq 升序），每项包含 role/content/seq/token_count/is_key_turn
             summaries: 分层摘要
             key_turn_seqs: 关键轮次 seq 列表（额外锚定，不被裁掉）
+            extra_system_tokens: 额外追加进 system prompt 的内容（如历史召回/长期记忆）
+                所需的 token 数，从历史预算中扣除，避免总输入越过上下文窗口
 
         Returns:
             ContextAssemblyResult
@@ -643,8 +646,8 @@ class ContextWindowManager:
         system_tokens = count_tokens(system_prompt)
         query_tokens = count_tokens(current_query)
 
-        # 剩余可用 token = 历史预算 - query_tokens（system 走 reserve）
-        available = self.history_budget - query_tokens
+        # 剩余可用 token = 历史预算 - query_tokens - 额外 system 内容（system 走 reserve）
+        available = self.history_budget - query_tokens - max(0, extra_system_tokens)
         if available < 200:
             available = 200  # 至少留 200 token 给历史
 
@@ -753,6 +756,7 @@ class ContextWindowManager:
         history_messages: list[dict],
         summaries: SummaryBundle,
         current_query: str = "",
+        extra_system_tokens: int = 0,
     ) -> tuple[str, list[str]]:
         """把对话历史压缩/蒸馏/丢弃后，渲染成一段可直接注入 prompt 的文本块。
 
@@ -767,6 +771,7 @@ class ContextWindowManager:
             history_messages: 历史消息（按 seq 升序，含 role/content/token_count/seq/turn_id）
             summaries: 分层摘要包
             current_query: 当前问题（用于扣除 query 占用的 token）
+            extra_system_tokens: 额外注入的 system 内容（召回/长期记忆）token 数，从预算中扣除
 
         Returns:
             (history_text, applied_strategies)
@@ -775,8 +780,8 @@ class ContextWindowManager:
         if not history_messages:
             return "", []
 
-        # 与 assemble() 一致的预算口径：历史预算 - 当前问题占用
-        available = self.history_budget - count_tokens(current_query)
+        # 与 assemble() 一致的预算口径：历史预算 - 当前问题占用 - 额外 system 内容
+        available = self.history_budget - count_tokens(current_query) - max(0, extra_system_tokens)
         if available < 200:
             available = 200
 

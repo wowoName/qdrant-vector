@@ -61,6 +61,16 @@ const routes: RouteRecordRaw[] = [
           requiresAdmin: true,
         },
       },
+      {
+        path: 'admin/disk',
+        name: 'DiskManagement',
+        component: () => import('@/pages/admin/DiskManagement.vue'),
+        meta: {
+          title: '磁盘管理',
+          subtitle: '查看磁盘总容量与各租户空间占用',
+          requiresAdmin: true,
+        },
+      },
     ],
   },
   {

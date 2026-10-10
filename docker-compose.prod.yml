@@ -1,0 +1,130 @@
+# ============================================================
+# 生产部署专用（全容器化）—— 阿里云 Windows / Linux ECS 通用
+# 用法：docker compose -f docker-compose.prod.yml up -d --build
+#
+# 架构：宿主机只需装 Docker，所有组件都在容器里跑
+#   浏览器 → frontend(Nginx :80) → backend(FastAPI :8000) → postgres / qdrant / redis
+#
+# 与本地开发的 docker-compose.yml 相互独立：
+#   本地开发：docker compose up -d qdrant redis
+#   生产部署：docker compose -f docker-compose.prod.yml up -d --build
+#
+# 安全：只有 frontend 的 80 端口暴露到宿主机，
+#      中间件与后端均只在 compose 内部网络可达；安全组只放行 22 / 80 / 443。
+#
+# 前置：先创建 backend/.env（cp backend/.env.example backend/.env 并按需修改）
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vdm-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=vdm_user
+      - POSTGRES_PASSWORD=vdm_password
+      - POSTGRES_DB=vdm_db
+      - TZ=Asia/Shanghai
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c timezone=Asia/Shanghai
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c work_mem=4MB
+      -c maintenance_work_mem=64MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vdm_user -d vdm_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.10.1
+    container_name: vdm-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      - QDRANT__LOG_LEVEL=INFO
+
+  redis:
+    image: redis:7-alpine
+    container_name: vdm-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vdm-backend
+    restart: unless-stopped
+    # 业务配置（密钥 / DB 账号 / API Key / SMTP 等）来自 .env
+    env_file:
+      - ./backend/.env
+    environment:
+      # 容器内部互通一律用「服务名」，覆盖 .env 里的 127.0.0.1
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - WORKERS=1
+      - TZ=Asia/Shanghai
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - CHAT_DB_HOST=postgres
+      - CHAT_DB_PORT=5432
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # 容器内路径（对应下面挂载的 /app/data）
+      - STORAGE_ROOT=/app/data/storage
+      - EMBEDDING_CACHE_DIR=/app/data/models
+      - LOG_FILE=/app/data/logs/vdm.log
+    volumes:
+      # 上传文件 / 模型 / 日志 / 导出 持久化到宿主机 backend/data
+      - ./backend/data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vdm-frontend
+    restart: unless-stopped
+    # 唯一对外暴露的端口：前端 Nginx
+    ports:
+      - '80:80'
+    depends_on:
+      - backend
+
+volumes:
+  qdrant-data:
+    name: vdm-qdrant-data
+  redis-data:
+    name: vdm-redis-data
+  postgres-data:
+    name: vdm-postgres-data

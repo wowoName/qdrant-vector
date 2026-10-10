@@ -6,7 +6,6 @@ import asyncio
 import time
 import traceback
 from collections.abc import Callable
-from datetime import datetime
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.db.task import TaskDB
+from app.utils.datetime_utils import now
 from app.utils.hash_utils import generate_id
 
 logger = get_logger(__name__)
@@ -142,14 +142,14 @@ class TaskService:
         """执行任务（在后台任务中调用）"""
         task = await self.get_task(task_id)
         task.status = "running"
-        task.started_at = datetime.utcnow()
+        task.started_at = now()
         await self.db.commit()
 
         handler = _task_handlers.get(task.type)
         if not handler:
             task.status = "failed"
             task.error_message = f"No handler registered for task type: {task.type}"
-            task.completed_at = datetime.utcnow()
+            task.completed_at = now()
             await self.db.commit()
             return
 
@@ -162,7 +162,7 @@ class TaskService:
             task.status = "completed"
             task.progress = 1.0
             task.result = result
-            task.completed_at = datetime.utcnow()
+            task.completed_at = now()
             await self.db.commit()
             logger.info(f"Task completed: {task.id}")
         except asyncio.CancelledError:
@@ -171,7 +171,7 @@ class TaskService:
             ok = await self._update_status_with_fallback(
                 task.id,
                 "cancelled",
-                completed_at=datetime.utcnow(),
+                completed_at=now(),
             )
             if not ok:
                 logger.warning(
@@ -226,13 +226,13 @@ class TaskService:
                 logger.error(f"Failed to read task retry count: {ex}")
                 return
 
-            now = datetime.utcnow()
+            now_ts = now()
             if retry_count < max_retries:
                 new_status = "pending"
                 completed_at = None
             else:
                 new_status = "failed"
-                completed_at = now
+                completed_at = now_ts
 
             try:
                 await self.db.execute(
@@ -250,7 +250,7 @@ class TaskService:
                         "rc": retry_count,
                         "err": error_msg,
                         "cat": completed_at,
-                        "uat": now,
+                        "uat": now_ts,
                         "tid": task_id,
                     },
                 )
@@ -277,7 +277,7 @@ class TaskService:
         task = await self.get_task(task_id, user_id=user_id)
         if task.status in ("running", "pending", "queued"):
             task.status = "cancelled"
-            task.completed_at = datetime.utcnow()
+            task.completed_at = now()
             await self.db.commit()
             # 立即更新缓存，确保后续 check_cancelled 能立即感知到
             self._cancel_cache[task_id] = (True, time.perf_counter())
@@ -292,13 +292,13 @@ class TaskService:
 
         带 1 秒缓存，避免流式处理中每个 batch 都查 DB 导致性能下降。
         """
-        now = time.perf_counter()
+        now_ts = time.perf_counter()
 
         # 检查缓存
         cached = self._cancel_cache.get(task_id)
         if cached is not None:
             cancelled, last_check = cached
-            if now - last_check < self._cancel_cache_ttl:
+            if now_ts - last_check < self._cancel_cache_ttl:
                 return cancelled
 
         # 缓存未命中或已过期，查 DB
@@ -319,7 +319,7 @@ class TaskService:
             cancelled = False
 
         # 更新缓存
-        self._cancel_cache[task_id] = (cancelled, now)
+        self._cancel_cache[task_id] = (cancelled, now_ts)
         return cancelled
 
     async def check_cancelled(self, task_id: str) -> None:
@@ -335,9 +335,9 @@ class TaskService:
         """
         from sqlalchemy import text
 
-        now = datetime.utcnow()
+        now_ts = now()
         fields = ["status = :status", "updated_at = :uat"]
-        params = {"status": status, "uat": now, "tid": task_id}
+        params = {"status": status, "uat": now_ts, "tid": task_id}
         for k, v in kwargs.items():
             fields.append(f"{k} = :{k}")
             params[k] = v

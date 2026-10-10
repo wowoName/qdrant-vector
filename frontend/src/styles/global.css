@@ -1,30 +1,31 @@
 /* ============================================================
-   新页 · 深空主题（Deep Space Theme）
-   暗色 / 玻璃拟态 / sci-fi 氛围
+   新页 · 极简白主题（Clean White Theme）
+   白色 / 轻量 / 克制留白 / 单一强调色
    ============================================================ */
 
 :root {
   /* 基础色板 */
-  --vdm-void: #04060d;
-  --vdm-bg: #070b15;
-  --vdm-panel: rgba(17, 23, 40, 0.72);
-  --vdm-panel-2: rgba(14, 19, 34, 0.86);
-  --vdm-panel-solid: #0e1424;
-  --vdm-border: rgba(122, 162, 255, 0.14);
-  --vdm-border-strong: rgba(122, 162, 255, 0.3);
-  --vdm-accent: #3d7dff;
-  --vdm-accent-2: #22d3ee;
-  --vdm-accent-3: #8b5cf6;
-  --vdm-text: #e9eefb;
-  --vdm-text-dim: #93a1c0;
-  --vdm-text-mute: #5f6d8c;
-  --vdm-glow: 0 0 26px rgba(61, 125, 255, 0.35);
+  --vdm-void: #f7f8fa;
+  --vdm-bg: #f7f8fa;
+  --vdm-panel: #ffffff;
+  --vdm-panel-2: #ffffff;
+  --vdm-panel-solid: #ffffff;
+  --vdm-border: #eaedf2;
+  --vdm-border-strong: #d8dde5;
+  --vdm-accent: #2563eb;
+  --vdm-accent-2: #0ea5e9;
+  --vdm-accent-3: #7c3aed;
+  --vdm-text: #1b2334;
+  --vdm-text-dim: #55607a;
+  --vdm-text-mute: #98a2b3;
+  --vdm-glow: 0 10px 30px rgba(37, 99, 235, 0.1);
   --vdm-radius: 14px;
 
   /* 字体 */
   --vdm-font: 'Sora', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei',
     'Segoe UI', sans-serif;
-  --vdm-font-display: 'Orbitron', 'Sora', sans-serif;
+  --vdm-font-display: 'Sora', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei',
+    sans-serif;
   --vdm-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Courier New', monospace;
 }
 
@@ -72,15 +73,15 @@ h4 {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(122, 162, 255, 0.2);
+  background: rgba(15, 23, 42, 0.14);
   border-radius: 8px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(122, 162, 255, 0.4);
+  background: rgba(15, 23, 42, 0.26);
 }
 
 /* ------------------------------------------------------------
-   氛围背景层：星云 + 网格（供 layout / auth 复用）
+   氛围背景层：极淡的光晕 + 细网格（供 layout / auth 复用）
    ------------------------------------------------------------ */
 .vdm-backdrop {
   position: fixed;
@@ -93,33 +94,20 @@ h4 {
 .vdm-backdrop::before {
   content: '';
   position: absolute;
-  inset: -25%;
-  background: radial-gradient(42% 34% at 12% 16%, rgba(61, 125, 255, 0.3), transparent 68%),
-    radial-gradient(38% 38% at 88% 10%, rgba(139, 92, 246, 0.22), transparent 68%),
-    radial-gradient(48% 42% at 72% 94%, rgba(34, 211, 238, 0.16), transparent 70%),
-    radial-gradient(30% 26% at 40% 60%, rgba(61, 125, 255, 0.1), transparent 70%);
-  filter: blur(24px);
-  animation: vdm-drift 26s ease-in-out infinite alternate;
+  inset: -20% -20% 0;
+  background: radial-gradient(46% 34% at 14% 0%, rgba(37, 99, 235, 0.07), transparent 70%),
+    radial-gradient(40% 30% at 88% 2%, rgba(14, 165, 233, 0.06), transparent 70%);
 }
 
 .vdm-backdrop::after {
   content: '';
   position: absolute;
   inset: 0;
-  background-image: linear-gradient(rgba(122, 162, 255, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(122, 162, 255, 0.055) 1px, transparent 1px);
+  background-image: linear-gradient(rgba(15, 23, 42, 0.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 23, 42, 0.028) 1px, transparent 1px);
   background-size: 46px 46px;
-  -webkit-mask-image: radial-gradient(130% 100% at 50% 0%, #000 26%, transparent 82%);
-  mask-image: radial-gradient(130% 100% at 50% 0%, #000 26%, transparent 82%);
-}
-
-@keyframes vdm-drift {
-  0% {
-    transform: translate3d(0, 0, 0) scale(1);
-  }
-  100% {
-    transform: translate3d(-3%, 2%, 0) scale(1.08);
-  }
+  -webkit-mask-image: radial-gradient(130% 90% at 50% 0%, #000 20%, transparent 78%);
+  mask-image: radial-gradient(130% 90% at 50% 0%, #000 20%, transparent 78%);
 }
 
 /* ------------------------------------------------------------
@@ -180,122 +168,104 @@ h4 {
 }
 
 /* ------------------------------------------------------------
-   Element Plus 暗色变量覆盖
+   Element Plus 主题变量覆盖（浅色）
    ------------------------------------------------------------ */
-html.dark {
-  --el-color-primary: #3d7dff;
-  --el-color-primary-light-3: #5a90ff;
-  --el-color-primary-light-5: #7aa6ff;
-  --el-color-primary-light-7: #9abdff;
-  --el-color-primary-light-8: #aecbff;
-  --el-color-primary-light-9: rgba(61, 125, 255, 0.16);
-  --el-color-primary-dark-2: #2f6ae6;
+:root {
+  --el-color-primary: #2563eb;
+  --el-color-primary-light-3: #5686f0;
+  --el-color-primary-light-5: #87aaf5;
+  --el-color-primary-light-7: #b8cdf9;
+  --el-color-primary-light-8: #d0defb;
+  --el-color-primary-light-9: #e9f0fe;
+  --el-color-primary-dark-2: #1d4fd0;
 
-  --el-color-success: #2fd39f;
-  --el-color-warning: #f0b24a;
-  --el-color-danger: #ff6b6b;
-  --el-color-info: #8a97b4;
+  --el-color-success: #16a34a;
+  --el-color-warning: #d97706;
+  --el-color-danger: #dc2626;
+  --el-color-info: #7a8699;
 
-  --el-bg-color: #0b1020;
-  --el-bg-color-page: #070b15;
-  --el-bg-color-overlay: #111730;
-  --el-fill-color: rgba(122, 162, 255, 0.08);
-  --el-fill-color-light: rgba(122, 162, 255, 0.06);
-  --el-fill-color-lighter: rgba(122, 162, 255, 0.04);
-  --el-fill-color-extra-light: rgba(122, 162, 255, 0.03);
-  --el-fill-color-dark: rgba(122, 162, 255, 0.12);
-  --el-fill-color-darker: rgba(122, 162, 255, 0.16);
-  --el-fill-color-blank: #0b1020;
+  --el-bg-color: #ffffff;
+  --el-bg-color-page: #f7f8fa;
+  --el-bg-color-overlay: #ffffff;
+  --el-fill-color: #f2f4f8;
+  --el-fill-color-light: #f6f7fa;
+  --el-fill-color-lighter: #fafbfc;
+  --el-fill-color-extra-light: #fcfdfe;
+  --el-fill-color-dark: #eceff4;
+  --el-fill-color-darker: #e5e9f0;
+  --el-fill-color-blank: #ffffff;
 
-  --el-text-color-primary: #e9eefb;
-  --el-text-color-regular: #c3cee6;
-  --el-text-color-secondary: #93a1c0;
-  --el-text-color-placeholder: #5f6d8c;
-  --el-text-color-disabled: #46536e;
+  --el-text-color-primary: #1b2334;
+  --el-text-color-regular: #55607a;
+  --el-text-color-secondary: #98a2b3;
+  --el-text-color-placeholder: #aab3c0;
+  --el-text-color-disabled: #c3cad4;
 
-  --el-border-color: rgba(122, 162, 255, 0.16);
-  --el-border-color-light: rgba(122, 162, 255, 0.12);
-  --el-border-color-lighter: rgba(122, 162, 255, 0.09);
-  --el-border-color-extra-light: rgba(122, 162, 255, 0.06);
-  --el-border-color-dark: rgba(122, 162, 255, 0.24);
-  --el-border-color-darker: rgba(122, 162, 255, 0.3);
+  --el-border-color: #e5e8ef;
+  --el-border-color-light: #eaedf2;
+  --el-border-color-lighter: #eef1f5;
+  --el-border-color-extra-light: #f4f6f9;
+  --el-border-color-dark: #d8dde5;
+  --el-border-color-darker: #c7cdd8;
 
-  --el-mask-color: rgba(4, 6, 13, 0.72);
-  --el-mask-color-extra-light: rgba(4, 6, 13, 0.4);
+  --el-mask-color: rgba(27, 35, 52, 0.42);
+  --el-mask-color-extra-light: rgba(27, 35, 52, 0.16);
 
-  --el-box-shadow: 0 14px 44px rgba(0, 0, 0, 0.5);
-  --el-box-shadow-light: 0 8px 26px rgba(0, 0, 0, 0.42);
-  --el-box-shadow-lighter: 0 4px 16px rgba(0, 0, 0, 0.35);
+  --el-box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+  --el-box-shadow-light: 0 6px 20px rgba(15, 23, 42, 0.06);
+  --el-box-shadow-lighter: 0 2px 10px rgba(15, 23, 42, 0.05);
 
   /* 表格 */
-  --el-table-bg-color: transparent;
-  --el-table-tr-bg-color: transparent;
-  --el-table-header-bg-color: rgba(122, 162, 255, 0.06);
-  --el-table-header-text-color: #93a1c0;
-  --el-table-text-color: #c3cee6;
-  --el-table-border-color: rgba(122, 162, 255, 0.12);
-  --el-table-row-hover-bg-color: rgba(122, 162, 255, 0.08);
-  --el-table-current-row-bg-color: rgba(61, 125, 255, 0.14);
-  --el-table-expanded-cell-bg-color: transparent;
-  --el-table-fixed-box-shadow: 0 0 12px rgba(0, 0, 0, 0.5);
+  --el-table-header-bg-color: #fafbfc;
+  --el-table-header-text-color: #55607a;
+  --el-table-text-color: #333d4f;
+  --el-table-border-color: #eaedf2;
+  --el-table-row-hover-bg-color: #f6f7fa;
+  --el-table-current-row-bg-color: #eef4ff;
 
   /* 卡片 / 弹层 */
-  --el-card-bg-color: rgba(17, 23, 40, 0.66);
-  --el-card-border-color: rgba(122, 162, 255, 0.12);
-  --el-dialog-bg-color: #0f1528;
-  --el-popover-bg-color: #111730;
-  --el-overlay-color-lighter: rgba(4, 6, 13, 0.7);
+  --el-card-bg-color: #ffffff;
 }
 
-html.dark body,
+html,
 body {
   font-family: var(--vdm-font);
 }
 
 /* 组件圆角统一 */
-html.dark .el-button {
+.el-button {
   border-radius: 10px;
 }
-html.dark .el-input__wrapper,
-html.dark .el-textarea__inner,
-html.dark .el-select__wrapper {
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper {
   border-radius: 10px;
 }
-html.dark .el-card {
+.el-card {
   border-radius: var(--vdm-radius);
-  backdrop-filter: blur(10px);
-}
-html.dark .el-dialog {
-  border-radius: 18px;
   border: 1px solid var(--vdm-border);
 }
-html.dark .el-tag {
+.el-dialog {
+  border-radius: 18px;
+  border: 1px solid var(--vdm-border);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.14);
+}
+.el-tag {
   border-radius: 7px;
 }
-html.dark .el-table {
-  background-color: transparent;
-}
-html.dark .el-table th.el-table__cell {
+.el-table th.el-table__cell {
   font-weight: 600;
-}
-html.dark .el-table__inner-wrapper::before {
-  background-color: rgba(122, 162, 255, 0.14);
-}
-html.dark .el-pagination {
-  --el-pagination-bg-color: transparent;
-  --el-pagination-button-bg-color: rgba(122, 162, 255, 0.08);
 }
 
 /* ------------------------------------------------------------
    左下角用户菜单（teleport 到 body，需全局样式）
    ------------------------------------------------------------ */
 .vdm-user-menu.el-popper {
-  background: rgba(14, 20, 36, 0.96) !important;
-  border: 1px solid var(--vdm-border-strong) !important;
+  background: #ffffff !important;
+  border: 1px solid var(--vdm-border) !important;
   border-radius: 14px !important;
-  backdrop-filter: blur(20px);
   padding: 6px !important;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6), var(--vdm-glow) !important;
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.14) !important;
 }
 .vdm-user-menu .el-dropdown-menu {
   background: transparent;
@@ -312,8 +282,8 @@ html.dark .el-pagination {
 }
 .vdm-user-menu .el-dropdown-menu__item:not(.is-disabled):hover,
 .vdm-user-menu .el-dropdown-menu__item:not(.is-disabled):focus {
-  background: rgba(61, 125, 255, 0.18);
-  color: #fff;
+  background: #eef4ff;
+  color: var(--vdm-accent);
 }
 .vdm-user-menu .el-dropdown-menu__item .el-icon {
   font-size: 16px;
@@ -326,16 +296,16 @@ html.dark .el-pagination {
   margin: 0 6px;
 }
 .vdm-user-menu .el-popper__arrow::before {
-  background: rgba(14, 20, 36, 0.96) !important;
-  border-color: var(--vdm-border-strong) !important;
+  background: #ffffff !important;
+  border-color: var(--vdm-border) !important;
 }
 
 /* ------------------------------------------------------------
-   通用玻璃面板
+   通用面板
    ------------------------------------------------------------ */
 .vdm-glass {
   background: var(--vdm-panel);
   border: 1px solid var(--vdm-border);
   border-radius: var(--vdm-radius);
-  backdrop-filter: blur(16px);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }

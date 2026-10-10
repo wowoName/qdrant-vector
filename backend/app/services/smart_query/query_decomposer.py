@@ -391,7 +391,8 @@ class QueryDecomposer:
                 prompt=f"请分解以下问题：\n\n{query}",
                 system_prompt=system_prompt,
                 temperature=0.1,
-                max_tokens=800,
+                # 推理模型的思考过程会占用 max_tokens，预算过小会导致 JSON 被截断/为空
+                max_tokens=2048,
             )
 
             logger.debug(f"LLM decomposition raw response for query '{query[:50]}...':\n{response}")

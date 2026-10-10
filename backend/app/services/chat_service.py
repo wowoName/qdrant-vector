@@ -36,7 +36,15 @@ from app.providers.llm.factory import get_chat_llm, get_rewrite_llm
 from app.repositories.conversation_repo import ConversationRepository
 from app.services.compaction_service import HistoryCompactionService
 from app.services.context_manager import ContextWindowManager
+from app.services.memory_service import UserMemoryService, build_recall_block
+from app.services.query_state import (
+    QueryStateResolver,
+    StateDelta,
+    apply_delta,
+    strip_reset_phrases,
+)
 from app.services.vector_service import VectorService
+from app.utils.token_utils import count_tokens
 
 logger = get_logger(__name__)
 
@@ -70,12 +78,19 @@ DIRECT_LLM_SYSTEM_PROMPT = """你是一个专业的 AI 助手，请根据你的�
 
 REWRITE_PROMPT_TEMPLATE = """请根据对话历史，将用户的最新问题改写为一个独立、完整、语义明确的查询语句。
 
+要求：
+1. 若最新问题省略了对话历史中出现过的限定主体（如企业/客户名称、人员、产品、时间范围等），必须补全到改写后的语句中。
+   例如：历史在讨论"海川智能装备有限公司"，最新问题"哪个业务员卖得最多"，
+   应改写为"海川智能装备有限公司哪个业务员销售额最多"。
+2. 保持最新问题的原始意图，不要臆造历史中不存在的信息。
+3. 只输出改写后的查询语句，不要包含任何解释或前缀。
+
 对话历史：
 {history}
 
 用户最新问题：{query}
 
-请直接输出改写后的查询语句，不要包含任何解释或前缀。"""
+改写后的查询语句："""
 
 # 支持的斜杠命令
 SUPPORTED_COMMANDS = {
@@ -110,6 +125,10 @@ class ChatService:
         self.conv_repo = ConversationRepository(self.chat_db)
         self.context_mgr = ContextWindowManager()
         self.compaction_service = HistoryCompactionService(self.chat_db)
+        # 多轮查询状态解析器（槽位状态 / 约束重置）
+        self.state_resolver = QueryStateResolver()
+        # 记忆服务：会话内按需历史召回 + 跨会话长期记忆
+        self.memory_service = UserMemoryService(self.chat_db)
         # SmartQuery 智能问数编排器（懒加载，首次使用时创建）
         self._smart_query_orchestrator = None
 
@@ -224,11 +243,21 @@ class ChatService:
         )
         summaries = await self.compaction_service.get_summaries(conv.id)
 
-        # 4. 问题改写（可选）
+        # 4. 多轮状态解析（槽位差异）：改写 / 规划 / 持久化共用
+        #    整个机制受 chat_scope_inheritance_enabled 门控：关闭时不读状态、不解析、不重置
+        scope_enabled = self._scope_enabled()
+        prev_state = await self._read_scope(conv.id) if scope_enabled else {}
+        delta = StateDelta(operation="new_query")
+        if scope_enabled and prev_state:
+            delta = await self.state_resolver.resolve(req.query, prev_state)
+        reset_like = scope_enabled and (delta.reset_all or bool(delta.remove_columns))
+        inherited_state = await self._apply_state_delta(conv.id, prev_state, delta)
+
+        # 4.1 问题改写（可选）——范围重置轮跳过改写，避免旧范围被改写粘回
         query_for_search = req.query
         rewritten_query = None
         # 无论是否指定了知识库，都支持改写（因为未指定时会搜索所有知识库）
-        if req.use_rewrite and history_for_rewrite:
+        if req.use_rewrite and history_for_rewrite and not reset_like:
             try:
                 rewritten_query = await self._rewrite_query(req.query, history_for_rewrite)
                 query_for_search = rewritten_query
@@ -236,6 +265,30 @@ class ChatService:
             except Exception as e:
                 logger.warning(f"Query rewrite failed: {e}, using original query")
                 query_for_search = req.query
+
+        # 4.2 重置短语里可能含字面维度词（如"不限制销售客户"里的"客户"），
+        #     规划前剥离，避免被误当成查询维度/实体
+        if reset_like:
+            stripped = strip_reset_phrases(req.query)
+            if stripped:
+                query_for_search = stripped
+                logger.debug(f"Reset phrase stripped: '{req.query}' -> '{query_for_search}'")
+
+        # 4.3 记忆增强：按需历史召回（更早的相关对话） + 跨会话长期记忆
+        #     与"是否携带历史消息"解耦：命中才注入，未命中零副作用
+        extra_parts: list[str] = []
+        recall_block = build_recall_block(history_msgs, req.query)
+        if recall_block:
+            extra_parts.append(recall_block)
+        memory_block = await self.memory_service.build_block(user_id, req.query)
+        if memory_block:
+            extra_parts.append(memory_block)
+        extra_context = "\n\n".join(extra_parts)
+        # 长度上限 + 计入上下文预算（避免撑爆模型窗口）
+        max_chars = int(getattr(settings, "chat_extra_context_max_chars", 1500) or 0)
+        if max_chars > 0 and len(extra_context) > max_chars:
+            extra_context = extra_context[:max_chars] + "…"
+        extra_context_tokens = count_tokens(extra_context) if extra_context else 0
 
         # 5. 先尝试 SmartQuery 智能问数（如果启用）
         smart_query_result = None
@@ -247,7 +300,12 @@ class ChatService:
                     history_messages=history_msgs,
                     summaries=summaries,
                     current_query=req.query,
+                    extra_system_tokens=extra_context_tokens,
                 )
+            # 叠加"按需历史召回 / 长期记忆"块（若有）
+            combined_history_text = "\n\n".join(
+                t for t in (smart_history_text, extra_context) if t
+            ) or None
             try:
                 smart_query_result = await self._try_smart_query(
                     query=query_for_search,
@@ -255,7 +313,8 @@ class ChatService:
                     session_id=session_id,
                     history_msgs=history_msgs,
                     top_k=req.top_k,
-                    history_text=(smart_history_text or None),
+                    history_text=combined_history_text,
+                    inherited_state=inherited_state,
                 )
             except Exception as e:
                 logger.warning(f"SmartQuery failed, falling back to regular RAG: {e}")
@@ -271,6 +330,16 @@ class ChatService:
             sq_references = smart_query_result.get("references", [])
             sq_is_kb = smart_query_result.get("is_kb_answer", True)
             sq_used_sql = smart_query_result.get("used_sql", False)
+
+            # 持久化本次生效的范围（供后续追问继承）
+            await self._persist_scope(
+                conv.id,
+                smart_query_result.get("plan_filters"),
+                smart_query_result.get("plan_scope"),
+                current_turn,
+            )
+            # 长期用户记忆：命中记忆意图时后台异步抽取并入库
+            self.memory_service.schedule_store(user_id, req.query, sq_answer, conv.id)
 
             # 将 SmartQuery 的引用转换为 ChatReference 格式
             references = [
@@ -346,7 +415,9 @@ class ChatService:
             score_threshold=0.0,
         )
         try:
-            search_result = await self.vector_service.search(search_collection_id, search_req, visible_ids=self.visible_ids)
+            search_result = await self.vector_service.search(
+                search_collection_id, search_req, visible_ids=self.visible_ids
+            )
         except (QdrantConnectionError, QdrantCollectionNotFoundError) as e:
             # Qdrant 不可达或集合不存在：降级为直接 LLM 回答
             logger.warning(f"Vector search unavailable, falling back to direct LLM answer: {e}")
@@ -432,12 +503,16 @@ class ChatService:
             system_prompt = SYSTEM_PROMPT_TEMPLATE.format(context=self._build_context(references))
         else:
             system_prompt = DIRECT_LLM_SYSTEM_PROMPT
+        # 注入"按需历史召回 / 长期记忆"块（若有）
+        if extra_context:
+            system_prompt = f"{system_prompt}\n\n{extra_context}"
 
         assembly = self.context_mgr.assemble(
             system_prompt=system_prompt,
             current_query=req.query,
             history_messages=history_msgs,
             summaries=summaries,
+            extra_system_tokens=extra_context_tokens,
         )
 
         # 9. 调用 LLM
@@ -498,6 +573,9 @@ class ChatService:
             await safe_rollback(self.chat_db)
 
         latency_ms = (time.time() - start_time) * 1000
+
+        # 长期用户记忆：命中记忆意图时后台异步抽取并入库
+        self.memory_service.schedule_store(user_id, req.query, final_answer, conv.id)
 
         return ChatResponse(
             session_id=session_id,
@@ -578,11 +656,21 @@ class ChatService:
             )
             summaries = await self.compaction_service.get_summaries(conv.id)
 
-            # 4. 问题改写
+            # 4. 多轮状态解析（槽位差异）
+            #    整个机制受 chat_scope_inheritance_enabled 门控
+            scope_enabled = self._scope_enabled()
+            prev_state = await self._read_scope(conv.id) if scope_enabled else {}
+            delta = StateDelta(operation="new_query")
+            if scope_enabled and prev_state:
+                delta = await self.state_resolver.resolve(req.query, prev_state)
+            reset_like = scope_enabled and (delta.reset_all or bool(delta.remove_columns))
+            inherited_state = await self._apply_state_delta(conv.id, prev_state, delta)
+
+            # 4.1 问题改写（范围重置轮跳过）
             query_for_search = req.query
             rewritten_query = None
             # 无论是否指定了知识库，都支持改写
-            if req.use_rewrite and history_for_rewrite:
+            if req.use_rewrite and history_for_rewrite and not reset_like:
                 yield {"type": "stage", "stage": "rewrite", "status": "start"}
                 try:
                     rewritten_query = await self._rewrite_query(req.query, history_for_rewrite)
@@ -592,6 +680,28 @@ class ChatService:
                     logger.warning(f"Query rewrite failed: {e}, using original query")
                     query_for_search = req.query
                 yield {"type": "stage", "stage": "rewrite", "status": "done"}
+
+            # 4.2 重置短语里可能含字面维度词，规划前剥离
+            if reset_like:
+                stripped = strip_reset_phrases(req.query)
+                if stripped:
+                    query_for_search = stripped
+                    logger.debug(f"Reset phrase stripped: '{req.query}' -> '{query_for_search}'")
+
+            # 4.3 记忆增强：按需历史召回 + 跨会话长期记忆（命中才注入）
+            extra_parts: list[str] = []
+            recall_block = build_recall_block(history_msgs, req.query)
+            if recall_block:
+                extra_parts.append(recall_block)
+            memory_block = await self.memory_service.build_block(user_id, req.query)
+            if memory_block:
+                extra_parts.append(memory_block)
+            extra_context = "\n\n".join(extra_parts)
+            # 长度上限 + 计入上下文预算（避免撑爆模型窗口）
+            max_chars = int(getattr(settings, "chat_extra_context_max_chars", 1500) or 0)
+            if max_chars > 0 and len(extra_context) > max_chars:
+                extra_context = extra_context[:max_chars] + "…"
+            extra_context_tokens = count_tokens(extra_context) if extra_context else 0
 
             # 5. 先尝试 SmartQuery 智能问数（如果启用）
             #    P1：合成阶段真流式——后台跑编排，同时把合成产生的 LLM 增量实时透传给前端，
@@ -604,21 +714,22 @@ class ChatService:
             # 供 SmartQuery 合成阶段注入（与常规 RAG 的 assemble 共用同一套策略，
             # 保证两条生成路径的上下文行为一致）。
             smart_history_text = ""
-            if (
-                settings.smart_query_enabled
-                and settings.smart_query_use_history
-                and history_msgs
-            ):
+            if settings.smart_query_enabled and settings.smart_query_use_history and history_msgs:
                 smart_history_text, _hist_applied = self.context_mgr.build_history_block(
                     history_messages=history_msgs,
                     summaries=summaries,
                     current_query=req.query,
+                    extra_system_tokens=extra_context_tokens,
                 )
                 if smart_history_text:
                     logger.debug(
                         f"SmartQuery history injected: chars={len(smart_history_text)}, "
                         f"strategies={_hist_applied}"
                     )
+            # 叠加"按需历史召回 / 长期记忆"块（若有）
+            combined_history_text = "\n\n".join(
+                t for t in (smart_history_text, extra_context) if t
+            ) or None
 
             if settings.smart_query_enabled:
                 yield {"type": "stage", "stage": "route", "status": "start"}
@@ -639,7 +750,8 @@ class ChatService:
                         history_msgs=history_msgs,
                         top_k=req.top_k,
                         delta_sink=(_sq_sink if sq_queue is not None else None),
-                        history_text=(smart_history_text or None),
+                        history_text=combined_history_text,
+                        inherited_state=inherited_state,
                     )
                 )
                 try:
@@ -666,6 +778,16 @@ class ChatService:
                 sq_references = smart_query_result.get("references", [])
                 sq_is_kb = smart_query_result.get("is_kb_answer", True)
                 sq_used_sql = smart_query_result.get("used_sql", False)
+
+                # 持久化本次生效的范围（供后续追问继承）
+                await self._persist_scope(
+                    conv.id,
+                    smart_query_result.get("plan_filters"),
+                    smart_query_result.get("plan_scope"),
+                    current_turn,
+                )
+                # 长期用户记忆：命中记忆意图时后台异步抽取并入库
+                self.memory_service.schedule_store(user_id, req.query, sq_answer, conv.id)
 
                 # 转换引用格式
                 references = [
@@ -725,7 +847,7 @@ class ChatService:
                 if not _streamed:
                     yield {"type": "delta", "content": sq_answer}
                 elif sq_answer.startswith(_streamed):
-                    _tail = sq_answer[len(_streamed):]
+                    _tail = sq_answer[len(_streamed) :]
                     if _tail:
                         yield {"type": "delta", "content": _tail}
                 else:
@@ -806,7 +928,9 @@ class ChatService:
                 score_threshold=0.0,
             )
             try:
-                search_result = await self.vector_service.search(search_collection_id, search_req, visible_ids=self.visible_ids)
+                search_result = await self.vector_service.search(
+                    search_collection_id, search_req, visible_ids=self.visible_ids
+                )
             except (QdrantConnectionError, QdrantCollectionNotFoundError) as e:
                 logger.warning(
                     f"Vector search unavailable, falling back to direct LLM answer (stream): {e}"
@@ -910,12 +1034,16 @@ class ChatService:
             system_prompt = SYSTEM_PROMPT_TEMPLATE.format(context=self._build_context(references))
         else:
             system_prompt = DIRECT_LLM_SYSTEM_PROMPT
+        # 注入"按需历史召回 / 长期记忆"块（若有）
+        if extra_context:
+            system_prompt = f"{system_prompt}\n\n{extra_context}"
 
         assembly = self.context_mgr.assemble(
             system_prompt=system_prompt,
             current_query=req.query,
             history_messages=history_msgs,
             summaries=summaries,
+            extra_system_tokens=extra_context_tokens,
         )
 
         # 9. 流式调用 LLM
@@ -994,6 +1122,9 @@ class ChatService:
             await safe_rollback(self.chat_db)
 
         latency_ms = (time.time() - start_time) * 1000
+
+        # 长期用户记忆：命中记忆意图时后台异步抽取并入库
+        self.memory_service.schedule_store(user_id, req.query, final_answer, conv.id)
 
         # 13. 输出 done 事件
         yield {
@@ -1130,9 +1261,7 @@ class ChatService:
         schema.messages = [ChatMessageSchema(role=m.role, content=m.content) for m in msgs]
         return schema
 
-    async def delete_conversation(
-        self, session_id: str, user_id: str | None = None
-    ) -> bool:
+    async def delete_conversation(self, session_id: str, user_id: str | None = None) -> bool:
         """删除（归档）会话
 
         user_id 传入时校验会话归属，非本人会话不允许删除。
@@ -1215,9 +1344,52 @@ class ChatService:
             prompt=REWRITE_PROMPT_TEMPLATE.format(history=history_text, query=query),
             system_prompt="你是一个专业的查询改写助手。",
             temperature=0.3,
-            max_tokens=200,
+            # 注意：若使用推理模型（如 deepseek 系列带 reasoning 的模型），思考过程会消耗
+            # max_tokens，预算过小会导致正式输出为空。这里给足预算。
+            max_tokens=1200,
         )
-        return result.strip()
+        return self._sanitize_rewrite(result, query)
+
+    @staticmethod
+    def _sanitize_rewrite(result: str | None, fallback: str) -> str:
+        """清洗问题改写结果
+
+        改写模型在上下文较长/包含表格时可能返回空串，若直接使用会把空查询传给
+        下游检索与合成，导致"没有看到问题"之类的无效回答。此处统一兜底：
+        - 去首尾空白与整体包裹引号、常见前缀
+        - 结果过短（<2 字）视为无效，回退到用户原始问题
+        """
+        if not result:
+            logger.warning("Query rewrite returned empty, fallback to original query")
+            return fallback
+
+        text = result.strip()
+
+        # 去掉整体包裹的引号（中英文）
+        for lq, rq in (('"', '"'), ("'", "'"), ("“", "”"), ("「", "」"), ("《", "》")):
+            if len(text) >= 2 and text.startswith(lq) and text.endswith(rq):
+                text = text[1:-1].strip()
+                break
+
+        # 去掉可能被模型带出的前缀
+        for prefix in (
+            "改写后的查询语句：",
+            "改写后的查询语句:",
+            "改写后的查询语句",
+            "改写后的问题：",
+            "改写：",
+            "查询语句：",
+            "查询：",
+        ):
+            if text.startswith(prefix):
+                text = text[len(prefix) :].strip()
+                break
+
+        if len(text) < 2:
+            logger.warning(f"Query rewrite result invalid ({result!r}), fallback to original query")
+            return fallback
+
+        return text
 
     def _build_context(self, references: list[ChatReference]) -> str:
         """从检索结果构造上下文文本"""
@@ -1264,10 +1436,106 @@ class ChatService:
                 return
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=heartbeat)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 yield {"type": "ping"}
                 continue
             yield event
+
+    @staticmethod
+    def _scope_enabled() -> bool:
+        return bool(getattr(settings, "chat_scope_inheritance_enabled", True))
+
+    async def _read_scope(self, conversation_id: str) -> dict:
+        try:
+            state = await self.conv_repo.get_conversation_state(conversation_id)
+            return state if isinstance(state, dict) else {}
+        except Exception as e:
+            logger.warning(f"Load conversation scope failed (non-critical): {e}")
+            return {}
+
+    async def _apply_state_delta(
+        self, conversation_id: str, prev_state: dict, delta: StateDelta
+    ) -> dict | None:
+        """按状态差异得到本轮可继承状态；若发生槽位移除/重置，立即持久化裁剪后的状态。
+
+        返回 None 表示无可继承内容。
+        """
+        if not self._scope_enabled() or not prev_state:
+            return None
+
+        effective = apply_delta(prev_state, delta)
+
+        if delta.reset_all or delta.remove_columns:
+            # 约束重置：即使本轮最终没有任何过滤条件，也要把裁剪后的状态落库，
+            # 否则会回退到旧状态（"不限制客户"失效）
+            try:
+                await self.conv_repo.set_conversation_state(conversation_id, dict(effective))
+            except Exception as e:
+                logger.warning(f"Persist slot reset failed (non-critical): {e}")
+            if delta.remove_columns:
+                effective = {**effective, "forbidden_columns": list(delta.remove_columns)}
+            logger.info(
+                f"State delta applied: op={delta.operation}, "
+                f"remove={list(delta.remove_columns)}, reset_all={delta.reset_all}, "
+                f"kept_filters={[f.get('column') for f in effective.get('filters', [])]}, "
+                f"group_by={effective.get('group_by')}"
+            )
+
+        if (
+            not effective.get("filters")
+            and not effective.get("group_by")
+            and not effective.get("forbidden_columns")
+        ):
+            return None
+        return effective
+
+    async def _persist_scope(
+        self,
+        conversation_id: str,
+        plan_filters: list[dict] | None,
+        plan_scope: dict | None = None,
+        turn: int = 0,
+    ) -> None:
+        """持久化本次生效的范围与维度槽位（二者皆空则不覆盖，避免丢失既有状态）
+
+        同时给每个条件打上来源元数据（source / turn / explicit / confidence）：
+        - 历史继承来的条件保留其原始轮次与 explicit=False
+        - 本轮显式指定的条件标记 explicit=True、turn=当前轮次
+        """
+        if not self._scope_enabled():
+            return
+        filters = plan_filters or []
+        scope = plan_scope or {}
+        if not filters and not scope:
+            return
+
+        stamped: list[dict] = []
+        for f in filters:
+            if not isinstance(f, dict):
+                continue
+            item = dict(f)
+            if item.get("source") == "inherited":
+                item.setdefault("explicit", False)
+                item.setdefault("turn", turn)
+            else:
+                item["source"] = item.get("source") or "explicit"
+                item["explicit"] = True
+                item["turn"] = turn
+            item.setdefault("confidence", 1.0)
+            stamped.append(item)
+
+        new_state: dict = {"filters": stamped}
+        if scope:
+            new_state.update({
+                "group_by": scope.get("group_by", ""),
+                "metric": scope.get("metric", ""),
+                "order_dir": scope.get("order_dir", ""),
+                "limit": scope.get("limit", 0),
+            })
+        try:
+            await self.conv_repo.set_conversation_state(conversation_id, new_state)
+        except Exception as e:
+            logger.warning(f"Persist conversation scope failed (non-critical): {e}")
 
     async def _try_smart_query(
         self,
@@ -1278,6 +1546,7 @@ class ChatService:
         top_k: int,
         delta_sink: Callable[[str], None] | None = None,
         history_text: str | None = None,
+        inherited_state: dict | None = None,
     ) -> dict | None:
         """
         尝试使用 SmartQuery 智能问数
@@ -1295,11 +1564,17 @@ class ChatService:
                 "used_vector": bool,
                 "reasoning": str,
                 "model": str,
+                "plan_filters": list,   # 本次生效的过滤条件（供会话范围继承持久化）
             }
             或 None（表示应该继续走原有流程）
         """
         orchestrator = self._get_smart_query_orchestrator()
         if orchestrator is None:
+            return None
+
+        # 空查询不做智能问数（改写异常时可能产生空串），交由上层回退到原始问题的常规流程
+        if not query or not query.strip():
+            logger.warning("SmartQuery skipped: empty query")
             return None
 
         # 绑定流式增量回调：合成阶段的 LLM 输出实时透传（不改变任何检索逻辑）
@@ -1318,6 +1593,7 @@ class ChatService:
                 session_id=session_id,
                 history_messages=history_msgs,
                 top_k=top_k,
+                inherited_state=inherited_state,
             )
 
             # 判断是否应该使用 SmartQuery 的结果
@@ -1359,6 +1635,10 @@ class ChatService:
             if not use_result:
                 return None
 
+            # 维度槽位（用于多轮继承分析对象/度量/条数）
+            # 单意图与多意图路径统一由编排层回传（多意图下 query_plan 为空，但仍可能继承维度槽位）
+            plan_scope: dict = dict(getattr(result, "effective_scope", None) or {})
+
             # 返回 SmartQuery 结果
             return {
                 "success": True,
@@ -1369,6 +1649,8 @@ class ChatService:
                 "used_vector": result.used_vector,
                 "reasoning": result.query_plan.reasoning if result.query_plan else "",
                 "model": "smart-query",
+                "plan_filters": result.effective_filters or [],
+                "plan_scope": plan_scope,
             }
 
         except Exception as e:

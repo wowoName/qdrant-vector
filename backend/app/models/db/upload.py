@@ -3,11 +3,11 @@ Upload Session ORM 模型（分片上传）
 """
 
 import uuid
-from datetime import datetime
 
 from sqlalchemy import JSON, BigInteger, Column, DateTime, Index, Integer, String
 
 from app.core.database import Base
+from app.utils.datetime_utils import now
 
 
 class UploadSessionDB(Base):
@@ -27,7 +27,7 @@ class UploadSessionDB(Base):
     status = Column(String(20), default="uploading")  # uploading/completed/expired/failed
     temp_dir = Column(String(500), nullable=False)
     expires_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=now)
+    updated_at = Column(DateTime, default=now, onupdate=now)
 
     __table_args__ = (Index("idx_status_expires", "status", "expires_at"),)

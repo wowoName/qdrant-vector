@@ -7,8 +7,8 @@
 - 乐观并发控制：用 conversation.version 做版本校验（并发写入冲突时重试）
 """
 
+import json
 import uuid
-from datetime import datetime
 from typing import List, Optional, Tuple
 
 from sqlalchemy import select, func, case
@@ -20,7 +20,13 @@ from app.core.redis import (
     cache_set_session_messages,
     cache_delete_session,
 )
-from app.models.db.chat import ConversationDB, MessageDB, ConversationSummaryDB
+from app.models.db.chat import (
+    ConversationDB,
+    MessageDB,
+    ConversationSummaryDB,
+    UserMemoryDB,
+)
+from app.utils.datetime_utils import now
 from app.utils.token_utils import count_tokens
 
 logger = get_logger(__name__)
@@ -69,7 +75,7 @@ class ConversationRepository:
                 # （支持在对话过程中切换知识库）
                 if collection_id and conv.collection_id != collection_id:
                     conv.collection_id = collection_id
-                    conv.updated_at = datetime.utcnow()
+                    conv.updated_at = now()
                     await self.db.flush()
                 return conv, False
 
@@ -157,11 +163,63 @@ class ConversationRepository:
         if not conv:
             return False
         conv.status = "archived"
-        conv.updated_at = datetime.utcnow()
+        conv.updated_at = now()
         await self.db.flush()
         # 清 Redis 缓存
         await cache_delete_session(session_id)
         return True
+
+    # ---------- 结构化会话状态（多轮范围继承） ----------
+
+    async def get_conversation_state(self, conversation_id: str) -> dict:
+        """读取会话的结构化状态（JSON），无则返回空 dict"""
+        conv = await self.db.get(ConversationDB, conversation_id)
+        if not conv or not conv.state_json:
+            return {}
+        try:
+            data = json.loads(conv.state_json)
+            return data if isinstance(data, dict) else {}
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid conversation state_json for {conversation_id}, reset")
+            return {}
+
+    async def set_conversation_state(self, conversation_id: str, state: dict) -> None:
+        """写入会话的结构化状态（JSON）"""
+        conv = await self.db.get(ConversationDB, conversation_id)
+        if not conv:
+            return
+        try:
+            conv.state_json = json.dumps(state or {}, ensure_ascii=False)
+            conv.updated_at = now()
+            await self.db.flush()
+        except Exception as e:
+            logger.warning(f"Failed to persist conversation state for {conversation_id}: {e}")
+
+    # ---------- 长期用户记忆 ----------
+
+    async def add_user_memory(
+        self, user_id: str, content: str, source_conversation_id: str = ""
+    ) -> None:
+        """追加一条长期用户记忆"""
+        mem = UserMemoryDB(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            content=content,
+            source_conversation_id=source_conversation_id or None,
+        )
+        self.db.add(mem)
+        await self.db.flush()
+
+    async def list_user_memories(self, user_id: str, limit: int = 200) -> List[UserMemoryDB]:
+        """列出某用户的长期记忆（新→旧）"""
+        stmt = (
+            select(UserMemoryDB)
+            .where(UserMemoryDB.user_id == user_id)
+            .order_by(UserMemoryDB.created_at.desc())
+            .limit(limit)
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
 
     # ---------- 消息读写 ----------
 
@@ -209,7 +267,7 @@ class ConversationRepository:
         conv.message_count += 1
         conv.version += 1  # 乐观锁版本号
         conv.total_tokens += token_count
-        conv.updated_at = datetime.utcnow()
+        conv.updated_at = now()
         # 首条用户消息作为标题
         if conv.title is None and role == "user":
             conv.title = content[:50]
@@ -357,7 +415,7 @@ class ConversationRepository:
             existing.start_seq = start_seq
             existing.end_seq = end_seq
             existing.version += 1
-            existing.updated_at = datetime.utcnow()
+            existing.updated_at = now()
             await self.db.flush()
             return existing
         else:

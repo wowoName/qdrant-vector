@@ -3,7 +3,7 @@
 """
 
 import os
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +29,7 @@ from app.models.schemas.document import (
 from app.providers.storage.factory import get_storage
 from app.services.collection_service import CollectionService
 from app.services.document_service import DocumentService
+from app.utils.datetime_utils import now
 from app.utils.file_utils import get_file_type, sanitize_filename
 from app.utils.hash_utils import generate_id, sha256_file
 
@@ -82,7 +83,7 @@ class UploadService:
         temp_dir = self._make_temp_dir(upload_id)
         os.makedirs(temp_dir, exist_ok=True)
 
-        expires_at = datetime.utcnow() + timedelta(hours=settings.upload_expire_hours)
+        expires_at = now() + timedelta(hours=settings.upload_expire_hours)
 
         session = UploadSessionDB(
             id=upload_id,

@@ -3,11 +3,11 @@ Collection ORM 模型
 """
 
 import uuid
-from datetime import datetime
 
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
 
 from app.core.database import Base
+from app.utils.datetime_utils import now
 
 
 class CollectionDB(Base):
@@ -26,5 +26,5 @@ class CollectionDB(Base):
     is_active = Column(Boolean, default=True)
     document_count = Column(Integer, default=0)
     chunk_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=now, index=True)
+    updated_at = Column(DateTime, default=now, onupdate=now)

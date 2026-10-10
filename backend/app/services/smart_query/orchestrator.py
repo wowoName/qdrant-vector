@@ -66,6 +66,7 @@ from .types import (
     AgentContext,
     MultiRetrievalResult,
     QueryIntent,
+    QueryOperation,
     QueryPlan,
     SQLQueryResult,
     RetrievalQueryResult,
@@ -142,6 +143,7 @@ class SmartQueryOrchestrator:
         session_id: str = "",
         history_messages: Optional[list[dict]] = None,
         top_k: int = 10,
+        inherited_state: Optional[dict] = None,
     ) -> AgentContext:
         """
         执行智能问数查询（多路并行架构）
@@ -152,6 +154,7 @@ class SmartQueryOrchestrator:
             session_id: 会话ID
             history_messages: 历史消息
             top_k: 每路检索返回的 top_k
+            inherited_state: 从会话状态继承的范围/维度（多轮继承）
 
         Returns:
             AgentContext 包含完整的执行结果
@@ -197,6 +200,7 @@ class SmartQueryOrchestrator:
                     top_k=top_k,
                     session_id=session_id,
                     history_messages=history_messages,
+                    inherited_state=inherited_state,
                 )
                 context.total_time_ms = (time.time() - start_time) * 1000
                 return context
@@ -258,8 +262,31 @@ class SmartQueryOrchestrator:
                 file_path=primary_file["file_path"],
                 sheet_name=primary_file.get("sheet_name", ""),
                 schema=primary_schema,
+                inherited_state=inherited_state,
             )
             context.query_plan = plan
+            # 回传本次生效的过滤条件（含来源元数据，供上层持久化为会话范围）
+            context.effective_filters = [
+                {
+                    "column": f.column,
+                    "value": f.value,
+                    "operator": f.operator,
+                    "column_alias": f.column_alias,
+                    "source": getattr(f, "source", "explicit"),
+                    "turn": getattr(f, "turn", 0),
+                    "explicit": getattr(f, "explicit", True),
+                    "confidence": getattr(f, "confidence", 1.0),
+                }
+                for f in plan.filters
+            ]
+            # 维度槽位（供多轮继承分析对象/度量/条数）
+            if plan.operation == QueryOperation.GROUP_AGG:
+                context.effective_scope = {
+                    "group_by": plan.group_by,
+                    "metric": plan.metric_column,
+                    "order_dir": plan.order_dir,
+                    "limit": plan.limit,
+                }
 
             logger.info(
                 f"Query analysis: intent={plan.intent.value}, "
@@ -291,6 +318,7 @@ class SmartQueryOrchestrator:
                 table_schemas=table_schemas,
                 collection_id=effective_collection,
                 top_k=actual_top_k,
+                inherited_state=inherited_state,
             )
             context.multi_retrieval = multi_result
             context.used_sql = bool(multi_result.sql_hits and multi_result.sql_success)
@@ -427,6 +455,7 @@ class SmartQueryOrchestrator:
         table_schemas: list,
         collection_id: str,
         top_k: int,
+        inherited_state: Optional[dict] = None,
     ) -> MultiRetrievalResult:
         """
         多表并行检索：对每个候选表分别做 SQL 检索，再加上向量/关键词检索
@@ -468,7 +497,12 @@ class SmartQueryOrchestrator:
                         file_path=fi["file_path"],
                         sheet_name=fi.get("sheet_name", ""),
                         schema=sch,
+                        inherited_state=inherited_state,
                     )
+                    # 分组聚合：单表不做 limit 截断，交由跨表合并后统一取 TopN，
+                    # 否则各表只取到本表 TopN，合并后会漏掉全局最优分组
+                    if t_plan.operation == QueryOperation.GROUP_AGG:
+                        t_plan.limit = 0
                     # 只有结构化查询且置信度足够才跑 SQL
                     use_sql = (
                         t_plan.needs_sql
@@ -574,6 +608,8 @@ class SmartQueryOrchestrator:
         # 例如3个销售表都返回了 SUM(销售金额)，合并成一个总值
         if len(tables_with_data) > 1:
             all_sql_hits = self._merge_aggregate_hits(all_sql_hits)
+            # 分组聚合结果跨表合并（同一维度值求和后再全局排名，最后按 limit 截断）
+            all_sql_hits = self._merge_group_agg_hits(all_sql_hits, limit=plan.limit or 0)
 
         # 结果融合（SQL 结果按来源表分组后再融合）
         if all_sql_hits or vector_hits or keyword_hits:
@@ -655,8 +691,6 @@ class SmartQueryOrchestrator:
         self, context: AgentContext, query: str, collection_id: str, top_k: int
     ) -> None:
         """纯向量检索路径（降级用）"""
-        from .types import QueryOperation
-
         start = time.time()
 
         try:
@@ -719,6 +753,7 @@ class SmartQueryOrchestrator:
         top_k: int,
         session_id: str,
         history_messages: list,
+        inherited_state: Optional[dict] = None,
     ) -> None:
         """
         多意图查询路径：多个子查询并行执行，结果合并后综合回答
@@ -739,6 +774,8 @@ class SmartQueryOrchestrator:
         table_files = await self._find_table_files(effective_collection)
         all_sql_hits = []
         all_vector_hits = []
+        collected_filters: list[dict] = []
+        collected_scope: dict = {}
 
         if not table_files:
             # 没有表格文件：每个子查询都走向量检索
@@ -816,6 +853,7 @@ class SmartQueryOrchestrator:
                                 file_path=primary_file["file_path"],
                                 sheet_name=primary_file.get("sheet_name", ""),
                                 schema=primary_schema_item,
+                                inherited_state=inherited_state,
                             )
                         except Exception as e:
                             logger.warning(f"Sub-query analyze failed: {e}")
@@ -881,19 +919,47 @@ class SmartQueryOrchestrator:
                     except Exception as e:
                         logger.warning(f"Vector retrieval failed for sub-query: {e}")
 
-                    return sub_sql_hits, sub_vector_hits
+                    # 回传该子查询生效的条件（供会话范围持久化）
+                    sub_plan_filters: list[dict] = []
+                    if primary_plan is not None:
+                        sub_plan_filters = [
+                            {
+                                "column": f.column,
+                                "value": f.value,
+                                "operator": f.operator,
+                                "column_alias": f.column_alias,
+                                "source": getattr(f, "source", "explicit"),
+                                "turn": getattr(f, "turn", 0),
+                                "explicit": getattr(f, "explicit", True),
+                                "confidence": getattr(f, "confidence", 1.0),
+                            }
+                            for f in primary_plan.filters
+                        ]
+                    # 维度槽位（分组聚合时）
+                    sub_scope: dict = {}
+                    if primary_plan is not None and primary_plan.operation == QueryOperation.GROUP_AGG:
+                        sub_scope = {
+                            "group_by": primary_plan.group_by,
+                            "metric": primary_plan.metric_column,
+                            "order_dir": primary_plan.order_dir,
+                            "limit": primary_plan.limit,
+                        }
+                    return sub_sql_hits, sub_vector_hits, sub_plan_filters, sub_scope
 
                 except Exception as e:
                     logger.error(f"Sub-query '{sub_q.query[:30]}...' failed: {e}")
-                    return [], []
+                    return [], [], [], {}
 
             # 并行执行所有子查询
             tasks = [_run_sub_query(sq) for sq in sub_queries]
             results = await asyncio.gather(*tasks)
 
-            for i, (sql_hits, vec_hits) in enumerate(results):
+            for i, (sql_hits, vec_hits, sub_filters, sub_scope) in enumerate(results):
                 all_sql_hits.extend(sql_hits)
                 all_vector_hits.extend(vec_hits)
+                collected_filters.extend(sub_filters)
+                if sub_scope and not collected_scope:
+                    collected_scope = sub_scope
 
         # Step 3: 合并结果
         # 给所有 hit 加上子查询标记，便于合成器区分来源
@@ -915,8 +981,6 @@ class SmartQueryOrchestrator:
             try:
                 fallback_plan = context.query_plan
                 if fallback_plan is None:
-                    from .types import QueryOperation
-
                     fallback_plan = QueryPlan(
                         intent=QueryIntent.SEMANTIC,
                         operation=QueryOperation.UNKNOWN,
@@ -944,6 +1008,18 @@ class SmartQueryOrchestrator:
         context.debug_info["vector_hits_count"] = len(all_vector_hits)
         context.sql_hits = all_sql_hits
         context.vector_hits = all_vector_hits
+
+        # 多意图路径同样回传生效条件（按列+值去重），供上层持久化为会话范围
+        seen_keys: set = set()
+        merged_filters: list[dict] = []
+        for f in collected_filters:
+            key = (f.get("column"), f.get("value"))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged_filters.append(f)
+        context.effective_filters = merged_filters
+        context.effective_scope = collected_scope
 
         # 兼容旧字段：设置 sql_result / used_sql / used_vector
         # 确保 chat_service 等调用方能正确判断是否使用 SmartQuery 结果
@@ -1069,8 +1145,6 @@ class SmartQueryOrchestrator:
 
         同时设置合理的上下限，防止极端值。
         """
-        from .types import QueryOperation
-
         # 默认值兜底
         default_k = self.default_top_k or 10
 
@@ -1110,13 +1184,15 @@ class SmartQueryOrchestrator:
         - EXISTS：top-1，找到即止
         - 语义类/未知：用 max_sql_files（默认 3）
         """
-        from .types import QueryOperation, QueryIntent
-
         op = getattr(plan, "operation", None)
         intent = getattr(plan, "intent", None)
 
         if op in (QueryOperation.SUM, QueryOperation.AVG, QueryOperation.COUNT):
             # 聚合类：查所有表（统计完整性优先）
+            return min(total_tables, 50)
+
+        if op == QueryOperation.GROUP_AGG:
+            # 分组聚合类：查所有表（跨表分组求和需要完整数据）
             return min(total_tables, 50)
 
         if op == QueryOperation.EXISTS:
@@ -1252,6 +1328,107 @@ class SmartQueryOrchestrator:
         # 最后是非聚合 hits（明细、列表等）
         result_hits.extend(non_agg_hits)
         return result_hits
+
+    @staticmethod
+    def _merge_group_agg_hits(hits: list, limit: int = 0) -> list:
+        """跨表合并分组聚合结果（GROUP_AGG）
+
+        多张销售表各自返回"按业务员分组的销售额"时，同一业务员需要跨表求和，
+        再在全局重新排序，得到真正的全局排名。最后按 limit 截断（0=不截断）。
+
+        合并规则（按 group_column + metric_column + agg_func 分组）：
+        - sum / count：跨表求和
+        - max / min：取极值
+        - avg：跨表按均值（近似：各组均值再平均）
+        排序方向沿用 payload.order_dir（默认 DESC），并重标 rank。
+        """
+        from .types import RetrievalHit, RetrievalSource
+
+        group_hits = [
+            h for h in hits if h.payload and h.payload.get("type") == "group_agg"
+        ]
+        if not group_hits:
+            return hits
+        other_hits = [
+            h for h in hits if not (h.payload and h.payload.get("type") == "group_agg")
+        ]
+
+        def _num(h) -> float:
+            try:
+                return float(h.payload.get("value", 0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        buckets: dict[tuple, dict] = {}
+        order_dir = "DESC"
+        for h in group_hits:
+            p = h.payload or {}
+            if p.get("empty"):
+                continue
+            order_dir = (p.get("order_dir") or order_dir).upper()
+            key = (
+                p.get("group_column", ""),
+                p.get("metric_column", ""),
+                p.get("agg_func", "sum"),
+            )
+            gval = p.get("group_value")
+            if gval is None or gval == "":
+                continue
+            agg = p.get("agg_func", "sum")
+            bucket = buckets.setdefault(key, {})
+            if gval not in bucket:
+                bucket[gval] = {"value": _num(h), "count": 1, "hit": h}
+            else:
+                cur = bucket[gval]
+                if agg == "max":
+                    cur["value"] = max(cur["value"], _num(h))
+                elif agg == "min":
+                    cur["value"] = min(cur["value"], _num(h))
+                else:  # sum / count / avg（avg 先累加，最后除以份数）
+                    cur["value"] += _num(h)
+                cur["count"] += 1
+
+        merged: list = []
+        reverse = order_dir != "ASC"
+        for (gcol, mcol, agg), bucket in buckets.items():
+            items = []
+            for gval, info in bucket.items():
+                v = info["value"]
+                if agg == "avg" and info["count"] > 0:
+                    v = v / info["count"]
+                items.append((gval, v, info["hit"]))
+            items.sort(key=lambda x: x[1], reverse=reverse)
+            if limit and limit > 0:
+                items = items[:limit]
+
+            for i, (gval, v, sample) in enumerate(items):
+                fmt = int(v) if float(v) == int(v) else round(v, 2)
+                hit = RetrievalHit(
+                    source=RetrievalSource.SQL,
+                    score=1.0,
+                    content=f"{gcol}：{gval}，{mcol or '记录数'}：{fmt}",
+                    payload={
+                        "type": "group_agg",
+                        "group_column": gcol,
+                        "group_value": gval,
+                        "metric_column": mcol,
+                        "metric_column_alias": mcol,
+                        "agg_func": agg,
+                        "order_dir": order_dir,
+                        "value": fmt,
+                        "rank": i + 1,
+                        "filters": (sample.payload or {}).get("filters", []),
+                        "is_merged": True,
+                        "source_table_count": len(bucket),
+                    },
+                    metadata={"merged": True, "rank": i + 1},
+                )
+                if i == 0:
+                    hit.payload["_total_groups"] = len(items)
+                    hit.payload["_shown_groups"] = len(items)
+                merged.append(hit)
+
+        return merged + other_hits
 
     # ------------------------------------------------------------------
     # 表格文件查找与排序
@@ -1413,9 +1590,17 @@ class SmartQueryOrchestrator:
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
         # 如果最高分仍然是 0，说明没有任何匹配，保持原顺序
-        if scored[0][0] == 0:
+        if scored[0][0] <= 0:
             return table_files
 
+        # 存在正相关表时，丢弃与查询"零相关"的表：
+        # 避免不相关表（如"员工信息"）的明细进入多表合并，污染统计结果与答案展示
+        ranked = [f for score, _, f in scored if score > 0]
+        if ranked:
+            dropped = [f.get("file_name", "") for score, _, f in scored if score <= 0]
+            if dropped:
+                logger.debug(f"Table ranking dropped irrelevant tables: {dropped}")
+            return ranked
         return [f for _, _, f in scored]
 
     async def _find_table_files(self, collection_id: str) -> list[dict]:

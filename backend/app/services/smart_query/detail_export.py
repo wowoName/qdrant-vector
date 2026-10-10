@@ -8,12 +8,12 @@
 import os
 import re
 import time
-from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.utils.datetime_utils import now
 
 logger = get_logger(__name__)
 
@@ -104,7 +104,7 @@ def export_sheets_to_excel(
             return None
 
         # 文件名：明细导出_时间戳_随机.xlsx
-        filename = f"明细导出_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}.xlsx"
+        filename = f"明细导出_{now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}.xlsx"
         file_path = get_export_dir() / filename
         wb.save(str(file_path))
 

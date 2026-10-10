@@ -13,7 +13,6 @@
 
 import json
 import uuid
-from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -26,6 +25,7 @@ from sqlalchemy import (
 )
 
 from app.core.database import Base
+from app.utils.datetime_utils import now
 
 
 class DocumentRecordDB(Base):
@@ -75,7 +75,7 @@ class DocumentRecordDB(Base):
     # 时间字段
     record_date = Column(String(32), nullable=True, index=True)  # 记录日期
 
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=now, index=True)
 
     __table_args__ = (
         Index("idx_doc_sheet_row", "document_id", "sheet_name", "row_number", unique=True),

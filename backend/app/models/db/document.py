@@ -3,7 +3,6 @@ Document & DocumentVersion & Chunk ORM 模型
 """
 
 import uuid
-from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
@@ -16,6 +15,7 @@ from sqlalchemy import (
 )
 
 from app.core.database import Base
+from app.utils.datetime_utils import now
 
 
 class DocumentDB(Base):
@@ -32,8 +32,8 @@ class DocumentDB(Base):
     current_version_id = Column(String(36), nullable=True)
     status = Column(String(20), default="pending")  # pending/processing/completed/failed
     error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=now, index=True)
+    updated_at = Column(DateTime, default=now, onupdate=now)
 
     __table_args__ = (Index("idx_collection_directory", "collection_id", "directory_id"),)
 
@@ -51,7 +51,7 @@ class DocumentVersionDB(Base):
     storage_path = Column(String(500), nullable=False)
     status = Column(String(20), default="processing")  # processing/completed/failed
     error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=now)
 
     __table_args__ = (Index("idx_doc_version", "document_id", "version_num"),)
 
@@ -71,6 +71,6 @@ class ChunkDB(Base):
     char_start = Column(Integer, default=0)
     char_end = Column(Integer, default=0)
     token_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=now)
 
     __table_args__ = (Index("idx_version_index", "version_id", "chunk_index", unique=True),)

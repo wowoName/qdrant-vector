@@ -15,6 +15,7 @@ RouterAgent - 路由代理
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from typing import Optional
@@ -22,6 +23,7 @@ from typing import Optional
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.providers.llm.factory import create_llm
+from app.services.query_state import enforce_removed_columns
 from .types import (
     EntityInfo,
     FilterInfo,
@@ -44,8 +46,8 @@ STRUCTURED_KEYWORDS_PATTERNS = [
     (r"每个.*多少|每个.*有|各个.*多少|按.*分组|按.*统计|按.*计算|分组统计|分别统计|分别计算", QueryOperation.GROUP_COUNT),
     # Top N
     (r"top\s*\d+|前\d+|排名|最高|最多|最大|第一名|前三|前十", QueryOperation.TOP_N),
-    # 求和
-    (r"总和|合计|共计|总计金额|总金额|总销量|销售额", QueryOperation.SUM),
+    # 求和（"金额/总额/销售额"类问法本质是求和）
+    (r"总和|合计|共计|总计金额|总金额|销售额|销售总额|总额|金额", QueryOperation.SUM),
     # 平均值
     (r"平均|均值|平均值", QueryOperation.AVG),
     # 详情查询（注意："分别是谁/都有谁/都是谁"属于列表类，不在这里匹配）
@@ -61,6 +63,25 @@ HIERARCHY_RELATION_KEYWORDS = [
     "的业务员", "的销售", "的人员",
 ]
 
+# 数值型列类型（用于识别 GROUP_AGG 的度量列）
+NUMERIC_TYPES = ("INTEGER", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC")
+
+# 分组聚合（GROUP_AGG）触发词：排名 / 极值
+GROUP_RANK_PATTERN = re.compile(
+    r"最多|最高|最大|最少|最低|最小|排名|排行|第一|榜首",
+    re.IGNORECASE,
+)
+# "前N / Top N"（N 支持阿拉伯数字与常见中文数字）
+GROUP_LIMIT_PATTERN = re.compile(r"前\s*([0-9一二三四五六七八九十两]+)|top\s*([0-9]+)", re.IGNORECASE)
+# 单值提问：哪个 / 哪一位 / 谁
+GROUP_SINGLE_HINT = re.compile(r"哪个|哪一个|哪位|哪一位|哪家|哪名|谁")
+# 升序（最少 / 最低 / 最差）
+GROUP_ASC_PATTERN = re.compile(r"最少|最低|最小|最差")
+# 分组统计词（无排名词时凭此触发，且必须同时命中数值度量列，避免误伤列表类问题）
+GROUP_STATS_PATTERN = re.compile(
+    r"按.{0,12}(分组|统计|汇总|合计|求和)|分组统计|每个|各个|每名|每位|分别.{0,8}(统计|汇总|合计)"
+)
+
 # 结构化查询置信度阈值（高于此值直接走 SQL，低于则走 LLM 确认）
 RULE_BASED_CONFIDENCE_THRESHOLD = 0.7
 
@@ -75,6 +96,9 @@ class RouterAgent:
     def __init__(self, schema_provider: Optional[SchemaProvider] = None):
         self.schema_provider = schema_provider or SchemaProvider()
         self._llm = None
+        # 查询计划缓存（LLM 规划较贵，相同问句 + 相同表结构可复用）
+        self._plan_cache: dict[tuple, QueryPlan] = {}
+        self._plan_cache_max = 512
 
     def _get_llm(self):
         """获取 LLM 实例（懒加载）"""
@@ -99,6 +123,7 @@ class RouterAgent:
         file_path: str,
         sheet_name: str = "",
         schema: Optional[TableSchema] = None,
+        inherited_state: Optional[dict] = None,
     ) -> QueryPlan:
         """
         分析用户问题，生成查询计划
@@ -108,6 +133,8 @@ class RouterAgent:
             file_path: Excel/CSV 文件路径
             sheet_name: Sheet 名
             schema: 可选，预加载的表结构
+            inherited_state: 可选，会话结构化状态（多轮范围/维度继承），形如
+                {"filters": [...], "group_by": "...", "metric": "...", "order_dir": "...", "limit": 3}
 
         Returns:
             QueryPlan 查询计划
@@ -125,74 +152,31 @@ class RouterAgent:
                     confidence=0.5,
                 )
 
+        # 计划缓存命中：相同问句 + 相同表结构 + 相同继承范围，直接复用（省一次 LLM 规划）
+        cached_plan = self._get_cached_plan(query, schema, inherited_state)
+        if cached_plan is not None:
+            logger.debug(f"Query plan cache hit: {query[:40]}")
+            return cached_plan
+
         # Step 1: 规则快速匹配（低成本、高确定性）
         rule_based_plan = self._rule_based_analyze(query, schema)
 
         # Step 2: 实体解析（所有路径都执行，不依赖 LLM）
+        entities: list[EntityInfo] = []
         try:
             entities = self._resolve_entities(query, file_path, sheet_name, schema)
-            rule_based_plan.entities = entities
         except Exception as e:
             logger.debug(f"Entity resolution failed: {e}")
 
-        # Step 3: 层级关系推断（所有路径都执行）
-        # 先尝试从 query 中匹配目标列
-        # 注意：DETAIL 操作不匹配目标列，因为 DETAIL 是查整行详情，目标列应该为空
-        # 如果 DETAIL 有目标列，会导致同名列的实体无法转为过滤条件
-        if not rule_based_plan.target_column and \
-           rule_based_plan.operation not in (QueryOperation.DETAIL, QueryOperation.EXISTS):
-            matched_target = self._match_target_column(query, schema)
-            if matched_target:
-                rule_based_plan.target_column = matched_target.name
-                rule_based_plan.target_column_alias = matched_target.name
+        # 规则计划做确定性后处理（实体 / 层级 / 目标列 / 数值聚合 / 分组聚合 / 纠偏）
+        rule_based_plan = self._postprocess_plan(
+            query, schema, rule_based_plan, entities, inherited_state
+        )
 
-        self._infer_hierarchy_relation(rule_based_plan, schema)
+        llm_first = getattr(settings, "smart_query_llm_first", True)
 
-        # 针对 SUM/AVG 操作的目标列推断（数值列匹配）
-        if rule_based_plan.operation in (QueryOperation.SUM, QueryOperation.AVG):
-            # SUM/AVG 的目标列必须是数值列
-            # 如果当前目标列不是数值列（比如匹配到了维度列"销售经理"），需要重新匹配
-            current_target = rule_based_plan.target_column
-            current_is_numeric = False
-            if current_target:
-                col = schema.get_column(current_target)
-                if col and col.data_type in ('BIGINT', 'DOUBLE', 'DECIMAL', 'INT', 'INTEGER', 'FLOAT', 'NUMBER'):
-                    current_is_numeric = True
-
-            if not current_is_numeric:
-                numeric_target = self._match_numeric_target_column(
-                    query, schema, rule_based_plan.operation
-                )
-                if numeric_target:
-                    # 原来的维度目标列 + 实体 → 转化为过滤条件
-                    if current_target and rule_based_plan.entities:
-                        for ent in rule_based_plan.entities:
-                            if ent.column_name == current_target and ent.name:
-                                # 检查是否已有相同的 filter
-                                existing = any(
-                                    f.column == current_target and f.value == ent.name
-                                    for f in rule_based_plan.filters
-                                )
-                                if not existing:
-                                    rule_based_plan.filters.append(FilterInfo(
-                                        column=current_target,
-                                        column_alias=ent.column_alias or current_target,
-                                        value=ent.name,
-                                        entity_name=ent.name,
-                                    ))
-
-                    rule_based_plan.target_column = numeric_target.name
-                    rule_based_plan.target_column_alias = numeric_target.name
-                    # 提升置信度（因为找到了明确的聚合目标列）
-                    if rule_based_plan.confidence < 0.95:
-                        rule_based_plan.confidence = min(0.95, rule_based_plan.confidence + 0.08)
-
-        # 统一的目标列后处理（修正各种目标列相关的问题）
-        self._finalize_target_column(rule_based_plan, schema)
-
-        # 如果规则匹配的置信度足够高，直接返回
-        if rule_based_plan.confidence >= RULE_BASED_CONFIDENCE_THRESHOLD:
-            # 计算 suggested_top_k
+        if not llm_first and rule_based_plan.confidence >= RULE_BASED_CONFIDENCE_THRESHOLD:
+            # 规则优先模式（可选回退）：高置信时直接用规则结果
             rule_based_plan.suggested_top_k = self._calc_suggested_top_k(rule_based_plan)
             logger.debug(
                 f"Rule-based intent detection: {rule_based_plan.intent}, "
@@ -202,84 +186,269 @@ class RouterAgent:
                 f"target={rule_based_plan.target_column}, "
                 f"suggested_top_k={rule_based_plan.suggested_top_k}"
             )
+            self._set_cached_plan(query, schema, rule_based_plan, inherited_state)
             return rule_based_plan
 
-        # Step 4: LLM 深度分析（高成本、更准确）
+        # Step 4: LLM 深度分析
+        # - LLM 主导（默认）：无论规则置信度如何，都以 LLM 计划为准，规则仅做校验/兜底
+        # - 规则优先（开关关闭）：低置信时才问 LLM，并融合两者
         llm_plan = await self._llm_based_analyze(query, schema)
 
-        # 融合规则和 LLM 的结果
-        final_plan = self._merge_plans(rule_based_plan, llm_plan)
+        if llm_plan is None:
+            # LLM 不可用 / 输出无效 → 回退规则计划（护栏）
+            logger.warning("LLM planning unavailable/invalid, fallback to rule-based plan")
+            final_plan = rule_based_plan
+        elif llm_first:
+            # 规则与 LLM 判定一致 → 提升置信度
+            if (
+                llm_plan.intent == rule_based_plan.intent
+                and llm_plan.operation == rule_based_plan.operation
+                and llm_plan.confidence < 0.98
+            ):
+                llm_plan.confidence = min(0.98, llm_plan.confidence + 0.1)
+            # 以 LLM 计划为基准，再做确定性后处理（实体/层级/目标列/分组聚合/纠偏）
+            final_plan = self._postprocess_plan(
+                query, schema, llm_plan, entities, inherited_state
+            )
+            # 规则阶段识别出的"属性投影"在 LLM 计划中可能缺失，补回
+            if not final_plan.projection_column and rule_based_plan.projection_column:
+                final_plan.projection_column = rule_based_plan.projection_column
+        else:
+            # 规则优先模式的低置信分支：融合规则与 LLM 结果
+            final_plan = self._merge_plans(rule_based_plan, llm_plan)
+            final_plan = self._postprocess_plan(
+                query, schema, final_plan, entities or rule_based_plan.entities,
+                inherited_state,
+            )
+            if not final_plan.projection_column and rule_based_plan.projection_column:
+                final_plan.projection_column = rule_based_plan.projection_column
 
-        # 确保实体信息传递到最终计划
-        if not final_plan.entities and rule_based_plan.entities:
-            final_plan.entities = rule_based_plan.entities
-
-        # 如果还没有层级关系，再推断一次
-        if not final_plan.hierarchy_relation:
-            # 先确保有目标列
-            if not final_plan.target_column:
-                matched_target = self._match_target_column(query, schema)
-                if matched_target:
-                    final_plan.target_column = matched_target.name
-                    final_plan.target_column_alias = matched_target.name
-
-            self._infer_hierarchy_relation(final_plan, schema)
-
-        # 针对 SUM/AVG 操作的目标列推断（数值列匹配）
-        if final_plan.operation in (QueryOperation.SUM, QueryOperation.AVG):
-            # SUM/AVG 的目标列必须是数值列
-            current_target = final_plan.target_column
-            current_is_numeric = False
-            if current_target:
-                col = schema.get_column(current_target)
-                if col and col.data_type in ('BIGINT', 'DOUBLE', 'DECIMAL', 'INT', 'INTEGER', 'FLOAT', 'NUMBER'):
-                    current_is_numeric = True
-
-            if not current_is_numeric:
-                numeric_target = self._match_numeric_target_column(
-                    query, schema, final_plan.operation
-                )
-                if numeric_target:
-                    # 原来的维度目标列 + 实体 → 转化为过滤条件
-                    if current_target and final_plan.entities:
-                        for ent in final_plan.entities:
-                            if ent.column_name == current_target and ent.name:
-                                existing = any(
-                                    f.column == current_target and f.value == ent.name
-                                    for f in final_plan.filters
-                                )
-                                if not existing:
-                                    final_plan.filters.append(FilterInfo(
-                                        column=current_target,
-                                        column_alias=ent.column_alias or current_target,
-                                        value=ent.name,
-                                        entity_name=ent.name,
-                                    ))
-
-                    final_plan.target_column = numeric_target.name
-                    final_plan.target_column_alias = numeric_target.name
-                    # 提升置信度
-                    if final_plan.confidence < 0.95:
-                        final_plan.confidence = min(0.95, final_plan.confidence + 0.08)
-
-        # 统一的目标列后处理（修正各种目标列相关的问题）
-        self._finalize_target_column(final_plan, schema)
-
-        # 兜底：规则阶段识别出的"属性投影"在 LLM 融合后可能丢失，补回
-        if not final_plan.projection_column and rule_based_plan.projection_column:
-            final_plan.projection_column = rule_based_plan.projection_column
-
-        # Step 5: 根据查询类型计算建议的 top_k
         final_plan.suggested_top_k = self._calc_suggested_top_k(final_plan)
 
         logger.info(
-            f"Query analysis completed: intent={final_plan.intent}, "
-            f"op={final_plan.operation}, "
+            f"Query analysis completed (llm_first={llm_first}): "
+            f"intent={final_plan.intent}, op={final_plan.operation}, "
+            f"target={final_plan.target_column}, group_by={final_plan.group_by}, "
+            f"metric={final_plan.metric_column}, "
+            f"filters={[(f.column, f.value) for f in final_plan.filters]}, "
             f"confidence={final_plan.confidence:.2f}, "
             f"suggested_top_k={final_plan.suggested_top_k}"
         )
 
+        self._set_cached_plan(query, schema, final_plan, inherited_state)
         return final_plan
+
+    # ------------------------------------------------------------------
+    # 查询计划缓存
+    # ------------------------------------------------------------------
+
+    def _plan_cache_key(
+        self, query: str, schema: TableSchema, inherited_state: Optional[dict] = None
+    ) -> tuple:
+        cols = tuple(c.name for c in schema.columns)
+        scope_filters = self._scope_filters(inherited_state)
+        scope = tuple(
+            sorted(
+                (str(f.get("column", "")), str(f.get("value", "")))
+                for f in scope_filters
+                if isinstance(f, dict)
+            )
+        )
+        group_by = ""
+        if isinstance(inherited_state, dict):
+            group_by = str(inherited_state.get("group_by") or "")
+        return (
+            (query or "").strip(),
+            schema.file_path or schema.table_name,
+            schema.sheet_name,
+            schema.row_count,
+            cols,
+            scope,
+            group_by,
+        )
+
+    def _get_cached_plan(
+        self, query: str, schema: TableSchema, inherited_state: Optional[dict] = None
+    ) -> Optional[QueryPlan]:
+        if not getattr(settings, "smart_query_plan_cache_enabled", True):
+            return None
+        plan = self._plan_cache.get(self._plan_cache_key(query, schema, inherited_state))
+        return copy.deepcopy(plan) if plan is not None else None
+
+    def _set_cached_plan(
+        self,
+        query: str,
+        schema: TableSchema,
+        plan: QueryPlan,
+        inherited_state: Optional[dict] = None,
+    ) -> None:
+        if not getattr(settings, "smart_query_plan_cache_enabled", True):
+            return
+        self._plan_cache[self._plan_cache_key(query, schema, inherited_state)] = copy.deepcopy(plan)
+        if len(self._plan_cache) > self._plan_cache_max:
+            # FIFO 淘汰最旧一条
+            self._plan_cache.pop(next(iter(self._plan_cache)), None)
+
+    # ------------------------------------------------------------------
+    # 确定性后处理（规则 / LLM 计划共用，作为"护栏"）
+    # ------------------------------------------------------------------
+
+    def _postprocess_plan(
+        self,
+        query: str,
+        schema: TableSchema,
+        plan: QueryPlan,
+        entities: Optional[list[EntityInfo]] = None,
+        inherited_state: Optional[dict] = None,
+    ) -> QueryPlan:
+        """对查询计划做确定性后处理（不改动 LLM 的结构化意图，只做规整与纠偏）
+
+        顺序：
+        1. 挂载实体（供层级过滤推断使用）
+        2. 继承会话范围（结构化 filters，当前查询未指定同列时补上）
+        3. 目标列匹配（非 DETAIL/EXISTS 且未指定时）
+        4. 层级关系推断（实体 → 过滤条件）
+        5. SUM/AVG 数值目标列推断
+        6. 目标列后处理（DETAIL/EXISTS/LIST 场景修正）
+        7. 分组聚合升级（GROUP_AGG，含"维度槽位"继承）/ TOP_N 纠偏
+        """
+        if entities:
+            plan.entities = entities
+
+        # 多轮范围继承：仅当当前计划未涉及该列时补上（当前查询显式同列条件优先/覆盖）
+        scope_filters = self._scope_filters(inherited_state)
+        if scope_filters:
+            self._merge_scope_filters(plan, scope_filters)
+
+        # 目标列（DETAIL 查整行详情、EXISTS 判断存在性，均不需要目标列）
+        if not plan.target_column and plan.operation not in (
+            QueryOperation.DETAIL,
+            QueryOperation.EXISTS,
+        ):
+            matched_target = self._match_target_column(query, schema)
+            if matched_target:
+                plan.target_column = matched_target.name
+                plan.target_column_alias = matched_target.name
+
+        self._infer_hierarchy_relation(plan, schema)
+
+        if plan.operation in (QueryOperation.SUM, QueryOperation.AVG):
+            self._infer_numeric_target_for_agg(plan, schema, query)
+
+        self._finalize_target_column(plan, schema)
+
+        # 分组聚合升级（当前问题未给出维度时，可继承上一轮的分析对象/度量/条数）
+        grouped_plan = self._maybe_group_agg(query, schema, plan, inherited_state)
+        if grouped_plan is not None:
+            plan = grouped_plan
+        else:
+            self._correct_top_n_target(query, schema, plan)
+
+        # 校验（护栏）：被显式移除的槽位不得在最终查询条件中重现
+        forbidden = ()
+        if isinstance(inherited_state, dict):
+            forbidden = tuple(inherited_state.get("forbidden_columns") or ())
+        if forbidden:
+            kept, dropped = enforce_removed_columns(plan.filters, forbidden)
+            if dropped:
+                logger.info(
+                    "Forbidden filters stripped (explicitly removed slot): "
+                    f"{[getattr(f, 'column', '') for f in dropped]}"
+                )
+                plan.filters = kept
+
+        return plan
+
+    @staticmethod
+    def _scope_filters(inherited_state: Optional[dict]) -> list[dict]:
+        """从会话状态中取出过滤条件（兼容旧的 list 形式）"""
+        if not inherited_state:
+            return []
+        if isinstance(inherited_state, dict):
+            filters = inherited_state.get("filters")
+            return filters if isinstance(filters, list) else []
+        if isinstance(inherited_state, list):
+            return inherited_state
+        return []
+
+    @staticmethod
+    def _merge_scope_filters(plan: QueryPlan, scope_filters: list[dict]) -> None:
+        """把会话继承的过滤条件合并进计划（同列以当前计划为准，携带来源元数据）"""
+        existing_cols = {f.column for f in plan.filters}
+        for item in scope_filters or []:
+            if not isinstance(item, dict):
+                continue
+            col = str(item.get("column") or "").strip()
+            val = item.get("value")
+            if not col or val in (None, ""):
+                continue
+            if col in existing_cols:
+                # 当前查询已显式指定该列（如换了一个客户）→ 覆盖，不继承
+                continue
+            try:
+                turn = int(item.get("turn") or 0)
+            except (TypeError, ValueError):
+                turn = 0
+            try:
+                confidence = float(item.get("confidence") or 1.0)
+            except (TypeError, ValueError):
+                confidence = 1.0
+            plan.filters.append(FilterInfo(
+                column=col,
+                column_alias=str(item.get("column_alias") or col),
+                operator=str(item.get("operator") or "="),
+                value=str(val),
+                entity_name=str(val),
+                # 合并进本轮计划 → 来源标记为"历史继承"，保留其最初产生的轮次
+                source="inherited",
+                turn=turn,
+                explicit=False,
+                confidence=confidence,
+            ))
+            existing_cols.add(col)
+
+    def _infer_numeric_target_for_agg(
+        self, plan: QueryPlan, schema: TableSchema, query: str
+    ) -> None:
+        """SUM/AVG 的目标列必须是数值列
+
+        若当前目标列不是数值列（如被误匹配到维度列"销售经理"）：
+        - 用数值度量列替换目标列
+        - 原维度目标列 + 实体 → 转为过滤条件
+        """
+        current_target = plan.target_column
+        current_is_numeric = False
+        if current_target:
+            col = schema.get_column(current_target)
+            if col and col.data_type in NUMERIC_TYPES:
+                current_is_numeric = True
+
+        if current_is_numeric:
+            return
+
+        numeric_target = self._match_numeric_target_column(query, schema, plan.operation)
+        if not numeric_target:
+            return
+
+        if current_target and plan.entities:
+            for ent in plan.entities:
+                if ent.column_name == current_target and ent.name:
+                    existing = any(
+                        f.column == current_target and f.value == ent.name
+                        for f in plan.filters
+                    )
+                    if not existing:
+                        plan.filters.append(FilterInfo(
+                            column=current_target,
+                            column_alias=ent.column_alias or current_target,
+                            value=ent.name,
+                            entity_name=ent.name,
+                        ))
+
+        plan.target_column = numeric_target.name
+        plan.target_column_alias = numeric_target.name
+        if plan.confidence < 0.95:
+            plan.confidence = min(0.95, plan.confidence + 0.08)
 
     # ------------------------------------------------------------------
     # 规则匹配
@@ -341,8 +510,13 @@ class RouterAgent:
             "分别是", "列出", "列表", "名单",
         ]
         has_list_intent = any(kw in query_lower for kw in list_intent_keywords)
-        if has_list_intent and operation in (QueryOperation.DETAIL, QueryOperation.COUNT):
-            # 如果有明确的列举意图，且当前匹配的是详情或计数，优先走列表
+        if has_list_intent and operation in (
+            QueryOperation.DETAIL,
+            QueryOperation.COUNT,
+            QueryOperation.SUM,
+            QueryOperation.AVG,
+        ):
+            # 如果有明确的列举意图，且当前匹配的是详情/计数/金额求和，优先走列表
             operation = QueryOperation.LIST
             confidence = max(confidence, 0.75)  # 列举意图置信度设高一些
             matched_pattern = "列举意图（有哪些/都有谁/分别是谁）"
@@ -397,18 +571,18 @@ class RouterAgent:
     # LLM 分析
     # ------------------------------------------------------------------
 
-    async def _llm_based_analyze(self, query: str, schema: TableSchema) -> QueryPlan:
-        """基于 LLM 的深度分析"""
+    async def _llm_based_analyze(
+        self, query: str, schema: TableSchema
+    ) -> Optional[QueryPlan]:
+        """基于 LLM 的深度分析
+
+        Returns:
+            QueryPlan；LLM 不可用 / 超时 / 输出无法解析时返回 None（由调用方回退规则计划）
+        """
         llm = self._get_llm()
         if llm is None:
-            # LLM 不可用，返回一个保守的默认值
-            return QueryPlan(
-                intent=QueryIntent.SEMANTIC,
-                operation=QueryOperation.UNKNOWN,
-                reasoning="LLM不可用，降级为语义检索",
-                needs_vector=True,
-                confidence=0.3,
-            )
+            logger.warning("LLM unavailable for query planning")
+            return None
 
         # 构造 schema 摘要（控制 token 数量）
         schema_summary = self._build_schema_summary(schema)
@@ -421,12 +595,14 @@ class RouterAgent:
 请分析用户的问题，输出严格的 JSON 格式，包含以下字段：
 {{
   "intent": "structured | semantic | hybrid | direct_answer",
-  "operation": "count | list | detail | group_count | sum | avg | top_n | exists | unknown",
+  "operation": "count | list | detail | group_count | sum | avg | top_n | group_agg | exists | unknown",
   "target_column": "要统计或列出的目标列名（从表结构中选择，用原始列名）",
   "filters": [
     {{"column": "列名", "operator": "= | != | > | < | >= | <= | LIKE", "value": "过滤值"}}
   ],
-  "group_by": "分组列名（分组统计时）",
+  "group_by": "分组列名（分组聚合时：要按哪个维度分组，如 业务员/客户/产品）",
+  "metric_column": "度量列名（分组聚合时：被聚合的数值列，如 销售金额）",
+  "agg_func": "sum | avg | count | max | min（分组聚合时的聚合函数，默认 sum）",
   "order_by": "排序列名",
   "order_dir": "ASC | DESC",
   "limit": 0,
@@ -443,31 +619,44 @@ class RouterAgent:
 2. 只输出 JSON，不要有其他解释性文字
 3. 如果无法确定 target_column 或 filters，留空字符串或空数组
 4. 所有列名必须从给定的表结构中选择，使用原始列名
-5. confidence 表示你对这个分析结果的把握程度"""
+5. confidence 表示你对这个分析结果的把握程度
+6. reasoning 请用一句话简述（40 字以内），避免输出过长导致 JSON 被截断"""
 
         user_prompt = f"用户问题：{query}"
+        formatted_system_prompt = system_prompt.format(schema_summary=schema_summary)
 
-        try:
-            result = await llm.simple_chat(
-                prompt=user_prompt,
-                system_prompt=system_prompt.format(schema_summary=schema_summary),
-                temperature=0.1,
-                max_tokens=800,
-            )
+        # 规划模型偶发返回空串/非 JSON（模型抖动），这里带重试；连续失败才回退规则
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = await llm.simple_chat(
+                    prompt=user_prompt,
+                    system_prompt=formatted_system_prompt,
+                    temperature=0.1,
+                    # 推理模型的思考过程会占用 max_tokens（此前 800 会把规划 JSON 截断）
+                    max_tokens=2048,
+                )
+            except Exception as e:
+                logger.warning(f"LLM planning call failed (attempt {attempt}/{max_attempts}): {e}")
+                continue
 
-            plan = self._parse_llm_response(result, schema)
-            plan.raw_response = result
+            raw = (result or "").strip()
+            if not raw:
+                logger.warning(f"LLM planning returned empty (attempt {attempt}/{max_attempts})")
+                continue
+
+            plan = self._parse_llm_response(raw, schema)
+            if plan is None:
+                logger.warning(
+                    f"LLM plan parse failed (attempt {attempt}/{max_attempts}): {raw[:200]!r}"
+                )
+                continue
+
+            plan.raw_response = raw
             return plan
 
-        except Exception as e:
-            logger.warning(f"LLM-based query analysis failed: {e}")
-            return QueryPlan(
-                intent=QueryIntent.SEMANTIC,
-                operation=QueryOperation.UNKNOWN,
-                reasoning=f"LLM分析失败，降级为语义检索: {e}",
-                needs_vector=True,
-                confidence=0.2,
-            )
+        logger.warning("LLM planning failed after retries, returning None for fallback")
+        return None
 
     def _build_schema_summary(self, schema: TableSchema) -> str:
         """构造 schema 摘要（控制长度）"""
@@ -495,22 +684,21 @@ class RouterAgent:
 
         return "\n".join(lines)
 
-    def _parse_llm_response(self, response: str, schema: TableSchema) -> QueryPlan:
-        """解析 LLM 的 JSON 响应"""
+    def _parse_llm_response(
+        self, response: str, schema: TableSchema
+    ) -> Optional[QueryPlan]:
+        """解析 LLM 的 JSON 响应（解析失败返回 None，交由调用方回退规则计划）"""
         # 提取 JSON（处理可能包含的 markdown 代码块或其他文字）
         json_str = self._extract_json(response)
 
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse LLM response as JSON: {e}")
-            return QueryPlan(
-                intent=QueryIntent.SEMANTIC,
-                operation=QueryOperation.UNKNOWN,
-                reasoning=f"JSON解析失败: {e}",
-                needs_vector=True,
-                confidence=0.2,
-            )
+        data = self._loads_llm_json(json_str)
+        if data is None:
+            logger.warning(f"Failed to parse LLM response as JSON: {json_str[:200]!r}")
+            return None
+
+        if not isinstance(data, dict):
+            logger.warning(f"LLM response is not a JSON object: {type(data).__name__}")
+            return None
 
         # 解析 intent
         intent_str = str(data.get("intent", "semantic")).lower()
@@ -560,6 +748,29 @@ class RouterAgent:
                         entity_name=str(f.get("value", "")),
                     ))
 
+        # 分组聚合：规范化维度列与数值度量列
+        group_by = ""
+        metric_column = ""
+        agg_func = "sum"
+        if operation == QueryOperation.GROUP_AGG:
+            raw_group = str(data.get("group_by", ""))
+            gcol = schema.get_column(raw_group) or schema.find_column_by_alias(raw_group)
+            group_by = gcol.name if gcol else ""
+            # 度量列优先取 metric_column，其次回退到 target_column（必须为数值列）
+            raw_metric = str(data.get("metric_column", "")) or target_col
+            mcol = None
+            if raw_metric:
+                mcol = schema.get_column(raw_metric) or schema.find_column_by_alias(raw_metric)
+            if mcol and mcol.data_type in NUMERIC_TYPES:
+                metric_column = mcol.name
+            fn = str(data.get("agg_func", "sum")).lower()
+            agg_func = fn if fn in ("sum", "avg", "count", "max", "min") else "sum"
+            # 分组聚合不使用行级 target_column（度量已由 metric_column 承载）
+            target_col = ""
+            target_alias = ""
+        else:
+            group_by = str(data.get("group_by", ""))
+
         confidence = float(data.get("confidence", 0.5))
         confidence = max(0.0, min(1.0, confidence))
 
@@ -569,7 +780,9 @@ class RouterAgent:
             target_column=target_col,
             target_column_alias=target_alias,
             filters=filters,
-            group_by=str(data.get("group_by", "")),
+            group_by=group_by,
+            metric_column=metric_column,
+            agg_func=agg_func,
             order_by=str(data.get("order_by", "")),
             order_dir=str(data.get("order_dir", "DESC")).upper(),
             limit=int(data.get("limit", 0) or 0),
@@ -599,6 +812,73 @@ class RouterAgent:
             return text[start : end + 1]
 
         return text
+
+    @staticmethod
+    def _loads_llm_json(json_str: str) -> Optional[dict]:
+        """解析 LLM 返回的 JSON，容忍被 max_tokens 截断的情况（尽力修复）"""
+        if not json_str:
+            return None
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+        repaired = RouterAgent._repair_truncated_json(json_str)
+        if repaired is None:
+            return None
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _close_json(text: str) -> str:
+        """补齐未闭合的字符串引号与括号，使截断的 JSON 片段成为合法 JSON"""
+        stack: list[str] = []
+        in_str = False
+        esc = False
+        for ch in text:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch in "{[":
+                    stack.append(ch)
+                elif ch in "}]" and stack:
+                    stack.pop()
+        if in_str:
+            text += '"'
+        text += "".join("}" if c == "{" else "]" for c in reversed(stack))
+        return text
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> Optional[str]:
+        """修复被截断的 JSON（模型输出超出 max_tokens 时）
+
+        做法：在末尾附近的逗号处截断并补齐引号/括号，返回第一个可解析的前缀。
+        """
+        s = (text or "").strip()
+        if not s.startswith("{") or len(s) > 8000:
+            return None
+
+        cut_points = [i for i, ch in enumerate(s) if ch == ","]
+        cut_points.append(len(s))
+        for cut in reversed(cut_points[-60:]):
+            candidate = s[:cut].rstrip()
+            if candidate.endswith(",") or candidate.endswith(":"):
+                candidate = candidate[:-1]
+            candidate = RouterAgent._close_json(candidate)
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                continue
+        return None
 
     # ------------------------------------------------------------------
     # 实体解析
@@ -682,6 +962,15 @@ class RouterAgent:
         if not hierarchy_cols:
             return None
 
+        # 已在问题中出现的列名：用于避免"别名只是某个更长列名的一部分"的误匹配。
+        # 例如"销售金额"中的"销售"是"销售经理"的别名，不应据此把目标列判为"销售经理"。
+        present_col_names = [
+            c.name for c in schema.columns if c.name and c.name in query
+        ]
+
+        def _shadowed(cand: str) -> bool:
+            return any(cand != cn and cand in cn for cn in present_col_names)
+
         best_col = None
         best_match_len = 0
 
@@ -690,7 +979,7 @@ class RouterAgent:
             for cand in candidates:
                 if not cand or len(cand) < 2:
                     continue
-                if cand in query and len(cand) > best_match_len:
+                if cand in query and not _shadowed(cand) and len(cand) > best_match_len:
                     best_match_len = len(cand)
                     best_col = col
 
@@ -762,6 +1051,248 @@ class RouterAgent:
 
         # 策略4：兜底 - 返回第一个数值列
         return numeric_cols[0] if numeric_cols else None
+
+    # ------------------------------------------------------------------
+    # 分组聚合（GROUP_AGG）推断
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cn_num_to_int(text: str) -> int:
+        """中文/阿拉伯数字 → 整数（支持 一 ~ 九十九 的常见写法）"""
+        if not text:
+            return 0
+        text = text.strip()
+        if text.isdigit():
+            return int(text)
+        digits = {
+            "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+            "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+        }
+        if text == "十":
+            return 10
+        if "十" in text:
+            left, _, right = text.partition("十")
+            tens = digits.get(left, 1) if left else 1
+            ones = digits.get(right, 0) if right else 0
+            return tens * 10 + ones
+        return digits.get(text, 0)
+
+    def _match_metric_column(self, query: str, schema: TableSchema):
+        """匹配 GROUP_AGG 的数值度量列（如"销售金额"）
+
+        策略：
+        1. 显式匹配：列名/别名出现在问题中（最长优先）
+        2. 业务优先级推断：问题未点名度量列时，按"金额/销售额 > 数量/销量"优先级选列
+        3. 不做"任意数值列"兜底 → 返回 None，交由调用方退化为分组计数
+        """
+        numeric_cols = [
+            c for c in schema.columns if c.data_type in NUMERIC_TYPES
+        ]
+        if not numeric_cols:
+            return None
+
+        query_lower = query.lower()
+
+        # 策略1：显式匹配问题中提到的数值列名
+        best_col = None
+        best_len = 0
+        for col in numeric_cols:
+            for cand in [col.name] + list(col.aliases or []):
+                if not cand or len(cand) < 2:
+                    continue
+                cand_clean = cand.replace("（元）", "").replace("(元)", "").strip()
+                if cand in query or cand_clean in query_lower:
+                    if len(cand) > best_len:
+                        best_len = len(cand)
+                        best_col = col
+        if best_col:
+            return best_col
+
+        # 策略2：业务优先级推断（金额类优先，其次数量类）
+        for kw in (
+            "销售金额", "销售额", "金额", "营业额", "业绩", "总额", "总金额",
+            "收入", "营收", "回款", "利润", "毛利", "销售",
+            "数量", "销量", "总数量", "单价", "价格",
+        ):
+            for col in numeric_cols:
+                if kw in col.name or any(kw in (a or "") for a in (col.aliases or [])):
+                    return col
+
+        return None
+
+    def _match_dimension_column(self, query: str, schema: TableSchema, exclude: str | None = None):
+        """匹配 GROUP_AGG 的分组维度列（分类/层级列，最长匹配优先）
+
+        - 排除数值列（维度不可能是度量列）
+        - 优先层级/分类列；名称匹配优先于别名匹配
+        """
+        candidates = schema.get_hierarchy_columns()
+        if not candidates:
+            candidates = [c for c in schema.columns if c.data_type not in NUMERIC_TYPES]
+
+        best_col = None
+        best_key: tuple | None = None
+        for col in candidates:
+            if col.data_type in NUMERIC_TYPES:
+                continue
+            if exclude and col.name == exclude:
+                continue
+            # (匹配文本, 权重)：列名权重 2，别名权重 1
+            cand_pairs = [(col.name, 2)] + [(a, 1) for a in (col.aliases or [])]
+            for cand, weight in cand_pairs:
+                if not cand or len(cand) < 2:
+                    continue
+                if cand in query:
+                    # 优先"更长"的匹配（更长意味着更具体，如"客户经理"优于"客户"），
+                    # 长度相同时再看是列名还是别名
+                    key = (len(cand), weight)
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best_col = col
+        return best_col
+
+    def _maybe_group_agg(
+        self,
+        query: str,
+        schema: TableSchema,
+        plan: QueryPlan,
+        inherited_state: Optional[dict] = None,
+    ) -> Optional[QueryPlan]:
+        """把（可能被误判为 TOP_N/GROUP_COUNT 的）计划升级为 GROUP_AGG。
+
+        触发条件：
+        A. 命中排名/极值词（最多/最高/前N/排名…）且能确定分组维度
+           → 分组聚合排名；无明确数值度量时退化为"分组计数排名"
+        B. 命中分组统计词（按…分组/每个/各个…）且同时命中维度与数值度量 → 分组聚合
+
+        维度（分析对象）也是可继承的"槽位"：当前问题未给出维度时，沿用上一轮的
+        group_by / metric / order_dir / limit（如"不限制销售客户，销售额前三"仍按客户经理排名）。
+
+        返回新的 QueryPlan（成功）或 None（不适用/保持原计划）。
+        """
+        if not getattr(settings, "smart_query_group_agg_enabled", True):
+            return None
+        if not query:
+            return None
+        # 幂等：已经是分组聚合计划则保持
+        if plan.operation == QueryOperation.GROUP_AGG and plan.group_by:
+            return None
+
+        has_rank = bool(GROUP_RANK_PATTERN.search(query))
+        has_group_stats = bool(GROUP_STATS_PATTERN.search(query))
+        if not (has_rank or has_group_stats):
+            return None
+
+        # 上一轮的分组槽位（用于继承）
+        inherited_group_by = ""
+        inherited_metric = ""
+        inherited_limit = 0
+        inherited_order_dir = ""
+        if isinstance(inherited_state, dict):
+            inherited_group_by = str(inherited_state.get("group_by") or "")
+            inherited_metric = str(inherited_state.get("metric") or "")
+            inherited_order_dir = str(inherited_state.get("order_dir") or "")
+            try:
+                inherited_limit = int(inherited_state.get("limit") or 0)
+            except (TypeError, ValueError):
+                inherited_limit = 0
+
+        metric_col = self._match_metric_column(query, schema)
+        if metric_col is None and inherited_metric:
+            metric_col = schema.get_column(inherited_metric) or schema.find_column_by_alias(
+                inherited_metric
+            )
+
+        dim_col = self._match_dimension_column(
+            query, schema, exclude=metric_col.name if metric_col else None
+        )
+        # 当前问题未给出维度 → 继承上一轮的分析对象
+        if dim_col is None and inherited_group_by:
+            dim_col = schema.get_column(inherited_group_by) or schema.find_column_by_alias(
+                inherited_group_by
+            )
+        if dim_col is None:
+            return None
+
+        # 无排名词（仅分组统计词）时，必须有明确数值度量，避免误伤列表类问题
+        if not has_rank and metric_col is None:
+            return None
+
+        # 排序方向：当前问题显式"最少/最低"优先，其次继承，最后默认降序
+        if GROUP_ASC_PATTERN.search(query):
+            order_dir = "ASC"
+        elif inherited_order_dir in ("ASC", "DESC"):
+            order_dir = inherited_order_dir
+        else:
+            order_dir = "DESC"
+
+        # 返回条数 N：当前问题显式值 > （仅排名类才允许）继承值 > 默认
+        limit = 0
+        m = GROUP_LIMIT_PATTERN.search(query)
+        if m:
+            limit = self._cn_num_to_int(m.group(1) or m.group(2) or "")
+        # 仅"排名/极值"类问题才继承上一轮的 Top-N；纯分组统计（每个X的Y）应返回全部分组
+        if limit <= 0 and has_rank and inherited_limit > 0:
+            limit = inherited_limit
+        if limit <= 0:
+            if has_rank:
+                # "哪个/谁" → 单个最优；否则给一个合理的 Top10
+                limit = 1 if GROUP_SINGLE_HINT.search(query) else 10
+            else:
+                limit = 0  # 分组统计：返回全部分组
+
+        agg_func = "sum" if metric_col is not None else "count"
+        metric_name = metric_col.name if metric_col is not None else ""
+        metric_desc = metric_name if metric_name else "记录数"
+
+        return QueryPlan(
+            intent=QueryIntent.STRUCTURED,
+            operation=QueryOperation.GROUP_AGG,
+            group_by=dim_col.name,
+            metric_column=metric_name,
+            agg_func=agg_func,
+            order_dir=order_dir,
+            limit=limit,
+            filters=list(plan.filters),
+            entities=list(plan.entities),
+            target_column="",
+            target_column_alias="",
+            reasoning=(
+                f"分组聚合：按「{dim_col.name}」分组，聚合「{metric_desc}」"
+                f"（{agg_func}），{order_dir}，limit={limit}"
+            ),
+            needs_sql=True,
+            needs_vector=False,
+            confidence=max(0.85, plan.confidence),
+        )
+
+    def _correct_top_n_target(self, query: str, schema: TableSchema, plan: QueryPlan) -> None:
+        """TOP_N 纠偏：目标列必须为数值列，否则"排序取前N"没有意义。
+
+        - 目标列非数值（如误匹配到文本维度列"业务员"）→ 改用数值度量列
+        - 无任何数值列 → 降级为 LIST，避免对文本列做无意义排序
+        """
+        if plan.operation != QueryOperation.TOP_N:
+            return
+
+        target = plan.target_column
+        is_numeric = False
+        if target:
+            col = schema.get_column(target) or schema.find_column_by_alias(target)
+            if col and col.data_type in NUMERIC_TYPES:
+                is_numeric = True
+
+        if is_numeric:
+            return
+
+        metric = self._match_metric_column(query, schema)
+        if metric is not None:
+            plan.target_column = metric.name
+            plan.target_column_alias = metric.name
+        else:
+            plan.operation = QueryOperation.LIST
+            plan.target_column = ""
+            plan.target_column_alias = ""
 
     def _finalize_target_column(self, plan: QueryPlan, schema: TableSchema) -> None:
         """
@@ -974,6 +1505,8 @@ class RouterAgent:
             return 20  # 列表明细需要更多数据支撑
         if op in (QueryOperation.SUM, QueryOperation.AVG):
             return 20  # 向量路径下尽量多取，SQL 路径不受影响
+        if op == QueryOperation.GROUP_AGG:
+            return 20  # SQL 由 limit 控制，向量兜底多取候选
 
         # --- 列表/分组统计类：信息要尽量完整 ---
         if op in (QueryOperation.LIST, QueryOperation.GROUP_COUNT, QueryOperation.DETAIL):

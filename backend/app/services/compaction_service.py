@@ -213,7 +213,7 @@ class HistoryCompactionService:
             prompt=prompt,
             system_prompt="你是一个专业的对话摘要助手，擅长提炼关键信息。",
             temperature=0.3,
-            max_tokens=500,
+            max_tokens=1200,
         )
         summary_text = summary_text.strip()
 
@@ -260,7 +260,7 @@ class HistoryCompactionService:
             prompt=prompt,
             system_prompt="你是一个专业的对话摘要助手。",
             temperature=0.3,
-            max_tokens=600,
+            max_tokens=1200,
         )
         mid_text = mid_text.strip()
 
@@ -308,7 +308,7 @@ class HistoryCompactionService:
             prompt=prompt,
             system_prompt="你是一个专业的对话摘要助手。",
             temperature=0.3,
-            max_tokens=500,
+            max_tokens=1200,
         )
         far_text = far_text.strip()
 

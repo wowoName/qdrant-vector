@@ -377,7 +377,8 @@ class SQLAgent:
                     schema_summary=schema_summary
                 ),
                 temperature=0.0,
-                max_tokens=500,
+                # 推理模型思考会占用 max_tokens，预算过小会拿不到 SQL
+                max_tokens=1500,
             )
 
             sql = self._extract_sql(result)
@@ -698,7 +699,7 @@ class SQLAgent:
                 prompt="请修复上面的SQL",
                 system_prompt=fix_prompt,
                 temperature=0.0,
-                max_tokens=500,
+                max_tokens=1500,
             )
 
             fixed_sql = self._extract_sql(result)

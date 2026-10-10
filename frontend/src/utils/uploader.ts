@@ -25,7 +25,14 @@ uploadRequest.interceptors.response.use(
     }
     return Promise.reject(data || new Error('Request failed'))
   },
-  (error) => Promise.reject(error)
+  (error) => {
+    // 将后端返回的业务提示（如"存储空间不足…"）透出给调用方，便于展示友好错误
+    const backendMessage = error?.response?.data?.message
+    if (backendMessage && typeof backendMessage === 'string') {
+      error.message = backendMessage
+    }
+    return Promise.reject(error)
+  }
 )
 
 // 默认分片大小 5MB

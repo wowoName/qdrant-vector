@@ -8,7 +8,6 @@ Chat ORM 模型 - 会话 / 消息 / 摘要
 """
 
 import uuid
-from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
@@ -22,6 +21,7 @@ from sqlalchemy import (
 )
 
 from app.core.chat_database import ChatBase
+from app.utils.datetime_utils import now
 
 
 class ConversationDB(ChatBase):
@@ -50,8 +50,11 @@ class ConversationDB(ChatBase):
     version = Column(Integer, default=0, nullable=False)
     # 状态：active / archived
     status = Column(String(20), default="active")
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    # 结构化会话状态（JSON 字符串）：保存跨轮次继承的范围（如已解析的过滤条件）
+    # 与摘要文本不同，这里是精确的结构化条件，用于多轮追问的范围继承
+    state_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now, index=True)
+    updated_at = Column(DateTime, default=now, onupdate=now, index=True)
 
     __table_args__ = (Index("idx_collection_user", "collection_id", "user_id"),)
 
@@ -80,7 +83,7 @@ class MessageDB(ChatBase):
     seq = Column(Integer, nullable=False, default=0)
     # 元数据 JSON（可选，存模型名、延迟等）
     meta = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=now, index=True)
 
     __table_args__ = (
         Index("idx_conv_seq", "conversation_id", "seq", unique=True),
@@ -112,7 +115,25 @@ class ConversationSummaryDB(ChatBase):
     end_seq = Column(Integer, default=0)
     # 版本号（同层摘要更新时递增）
     version = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=now)
+    updated_at = Column(DateTime, default=now, onupdate=now)
 
     __table_args__ = (Index("idx_conv_level", "conversation_id", "level", unique=True),)
+
+
+class UserMemoryDB(ChatBase):
+    """用户长期记忆（跨会话）
+
+    保存用户偏好、业务背景、长期约束等"跨会话仍然有效"的信息，
+    与聊天记录分开存储：聊天记录是原始流水，长期记忆是筛选后的画像。
+    """
+
+    __tablename__ = "user_memories"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(64), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    # 来源会话（可追溯）
+    source_conversation_id = Column(String(36), nullable=True)
+    created_at = Column(DateTime, default=now, index=True)
+    updated_at = Column(DateTime, default=now, onupdate=now)

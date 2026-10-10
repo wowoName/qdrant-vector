@@ -97,7 +97,7 @@
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
-import dayjs from 'dayjs'
+import { formatAppTime } from '@/utils/datetime'
 import request from '@/utils/request'
 
 const tasks = ref<any[]>([])
@@ -192,7 +192,7 @@ function progressStatus(status: string) {
 }
 
 function formatDate(date: string) {
-  return dayjs(date).format('YYYY-MM-DD HH:mm:ss')
+  return formatAppTime(date)
 }
 
 onMounted(() => {

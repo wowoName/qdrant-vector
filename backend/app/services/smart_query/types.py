@@ -49,7 +49,14 @@ class QueryOperation(str, Enum):
     """平均值"""
 
     TOP_N = "top_n"
-    """Top N 排名"""
+    """Top N 排名（行级：按某个数值列对原始记录排序取前 N 行）"""
+
+    GROUP_AGG = "group_agg"
+    """分组聚合排名（组级：按维度分组 + 聚合度量 + 组间排序）
+
+    典型问题："哪个业务员销售的最多"、"销售额排名前三的客户"。
+    与 TOP_N 的区别：TOP_N 对原始行排序，GROUP_AGG 先 GROUP BY 维度再聚合排序。
+    """
 
     EXISTS = "exists"
     """是否存在"""
@@ -167,6 +174,18 @@ class FilterInfo:
     entity_name: str = ""
     """对应的实体名称（如果是通过实体解析得到的）"""
 
+    source: str = "explicit"
+    """条件来源：explicit（本轮显式）/ inherited（历史继承）/ default（默认或业务规则）"""
+
+    turn: int = 0
+    """条件最初产生的轮次（用于状态追踪）"""
+
+    explicit: bool = True
+    """是否由用户显式指定（False 表示从历史继承而来）"""
+
+    confidence: float = 1.0
+    """该条件的置信度（0-1）"""
+
 
 @dataclass
 class EntityInfo:
@@ -225,7 +244,17 @@ class QueryPlan:
     """过滤条件列表（强类型）"""
 
     group_by: str = ""
-    """分组列（分组统计时）"""
+    """分组列（分组统计/分组聚合时）"""
+
+    metric_column: str = ""
+    """度量列（GROUP_AGG 时被聚合的数值列，如"销售金额"）
+
+    与 target_column 区分：target_column 表示"统计/列出的对象"，
+    metric_column 专用于 GROUP_AGG 的聚合度量，避免语义混用。
+    """
+
+    agg_func: str = "sum"
+    """聚合函数（GROUP_AGG 时有效）：sum / avg / count / max / min"""
 
     order_by: str = ""
     """排序列"""
@@ -498,6 +527,17 @@ class AgentContext:
 
     used_keyword: bool = False
     """是否使用了关键词检索"""
+
+    effective_filters: list[dict] = field(default_factory=list)
+    """本次查询实际生效的过滤条件（结构化）
+    形如 [{"column": "客户", "value": "瑞丰机电有限公司", "operator": "="}]，
+    供上层做多轮范围继承（会话结构化状态）。
+    """
+
+    effective_scope: dict = field(default_factory=dict)
+    """本次生效的维度槽位（group_by / metric / order_dir / limit），供多轮维度继承。
+    多意图路径下同样可用（取任一子查询的分组槽位）。
+    """
 
     # 元数据
     total_time_ms: float = 0.0

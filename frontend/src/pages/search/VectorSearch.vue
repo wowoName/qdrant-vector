@@ -131,9 +131,9 @@ async function handleSearch() {
 }
 
 function scoreColor(score: number) {
-  if (score >= 0.8) return '#67c23a'
-  if (score >= 0.6) return '#e6a23c'
-  return '#f56c6c'
+  if (score >= 0.8) return '#16a34a'
+  if (score >= 0.6) return '#d97706'
+  return '#dc2626'
 }
 
 function getCollectionName(id: string) {
@@ -185,7 +185,7 @@ onMounted(() => {
   max-height: 200px;
   overflow-y: auto;
   color: var(--vdm-text-dim);
-  background: rgba(122, 162, 255, 0.05);
+  background: #f7f8fa;
   border: 1px solid var(--vdm-border);
 }
 </style>

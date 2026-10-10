@@ -15,23 +15,7 @@
       <!-- 品牌 -->
       <div class="brand">
         <div class="brand-mark">
-          <svg viewBox="0 0 48 48" width="22" height="22" aria-hidden="true">
-            <defs>
-              <linearGradient id="vdmMarkG" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0%" stop-color="#ffffff" />
-                <stop offset="100%" stop-color="#cfe0ff" />
-              </linearGradient>
-            </defs>
-            <path
-              d="M24 4 41 14v20L24 44 7 34V14z"
-              fill="none"
-              stroke="url(#vdmMarkG)"
-              stroke-width="2.4"
-              stroke-linejoin="round"
-            />
-            <circle cx="24" cy="24" r="5.4" fill="url(#vdmMarkG)" />
-            <circle cx="24" cy="24" r="10.5" fill="none" stroke="rgba(255,255,255,.55)" stroke-width="1.4" />
-          </svg>
+          <img :src="logoUrl" alt="系统 Logo" />
         </div>
         <div class="brand-text">
           <span class="brand-name">{{ APP_NAME }}</span>
@@ -98,6 +82,25 @@
 
       <!-- 左下角：用户区 -->
       <div class="sidebar-footer">
+        <div v-if="user" class="storage-usage">
+          <div class="storage-head">
+            <span class="storage-label">存储空间</span>
+            <span class="storage-value">
+              <template v-if="user.storage_unlimited">不限制</template>
+              <template v-else>
+                {{ formatSize(user.storage_used || 0) }} / {{ formatSize(user.storage_quota || 0) }}
+              </template>
+            </span>
+          </div>
+          <el-progress
+            v-if="!user.storage_unlimited"
+            :percentage="storagePercent"
+            :stroke-width="6"
+            :show-text="false"
+            :status="storagePercent >= 100 ? 'exception' : undefined"
+          />
+        </div>
+
         <div class="sys-status">
           <span class="status-dot"></span>
           <span>系统在线</span>
@@ -133,6 +136,9 @@
               </el-dropdown-item>
               <el-dropdown-item v-if="isAdminUser" command="users">
                 <el-icon><User /></el-icon>用户管理
+              </el-dropdown-item>
+              <el-dropdown-item v-if="isAdminUser" command="disk">
+                <el-icon><DataLine /></el-icon>磁盘管理
               </el-dropdown-item>
               <el-dropdown-item divided command="profile">
                 <el-icon><EditPen /></el-icon>个人资料
@@ -201,7 +207,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import {
@@ -213,14 +219,17 @@ import {
   Collection,
   List,
   User,
+  DataLine,
   EditPen,
   SwitchButton,
   ArrowLeft,
   ArrowUp,
 } from '@element-plus/icons-vue'
 import { deleteConversation, type Conversation } from '@/api/chat'
+import logoUrl from '@/assets/images/logo.jpg'
+import { formatAppTime, parseAppTime } from '@/utils/datetime'
 import { clearAuth, getUser, isAdmin as isAdminFn, roleLabel as getRoleLabel, setUser } from '@/utils/user'
-import { updateMe } from '@/api/auth'
+import { getMe, updateMe } from '@/api/auth'
 import { useChatStore } from '@/stores/chat'
 import { APP_NAME } from '@/config/app'
 
@@ -243,6 +252,21 @@ const isImmersive = computed(() => route.name === 'Chat')
 const pageTitle = computed(() => (route.meta?.title as string) || '')
 const pageSubtitle = computed(() => (route.meta?.subtitle as string) || '')
 
+/** 当前租户存储空间使用百分比 */
+const storagePercent = computed(() => {
+  const u = user.value
+  if (!u || u.storage_unlimited || !u.storage_quota) return 0
+  return Math.min(100, Math.round(((u.storage_used || 0) / u.storage_quota) * 100))
+})
+
+function formatSize(bytes: number): string {
+  if (!bytes || bytes < 0) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
 const filteredConversations = computed(() => {
   const list = chat.conversations
   if (!keyword.value) return list
@@ -255,8 +279,9 @@ function isActiveConv(conv: Conversation) {
 }
 
 function formatTime(dateStr: string): string {
-  const date = new Date(dateStr)
-  const diff = Date.now() - date.getTime()
+  const date = parseAppTime(dateStr)
+  if (!date) return ''
+  const diff = Date.now() - date.valueOf()
   const minutes = Math.floor(diff / 60000)
   const hours = Math.floor(diff / 3600000)
   const days = Math.floor(diff / 86400000)
@@ -264,7 +289,7 @@ function formatTime(dateStr: string): string {
   if (minutes < 60) return `${minutes}分钟前`
   if (hours < 24) return `${hours}小时前`
   if (days < 7) return `${days}天前`
-  return `${date.getMonth() + 1}/${date.getDate()}`
+  return formatAppTime(dateStr, 'M/D')
 }
 
 function goChat() {
@@ -318,8 +343,10 @@ function handleCommand(command: string) {
   else if (command === 'search') router.push('/search')
   else if (command === 'tasks') router.push('/tasks')
   else if (command === 'users') router.push('/admin/users')
+  else if (command === 'disk') router.push('/admin/disk')
   else if (command === 'profile') openProfile()
   else if (command === 'logout') {
+    chat.clearUserData()
     clearAuth()
     router.push('/login')
   }
@@ -385,7 +412,27 @@ async function handleSaveProfile() {
 onMounted(() => {
   chat.fetchConversations()
   chat.fetchCollections()
+  refreshUser()
 })
+
+/** 刷新当前用户信息（含存储配额/已用空间） */
+async function refreshUser() {
+  try {
+    const me = await getMe()
+    setUser(me)
+    user.value = me
+  } catch {
+    // 未登录或网络异常时保持本地缓存
+  }
+}
+
+// 路由切换时刷新，保持侧边栏存储空间用量为最新
+watch(
+  () => route.fullPath,
+  () => {
+    refreshUser()
+  }
+)
 </script>
 
 <style scoped>
@@ -406,8 +453,7 @@ onMounted(() => {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(180deg, rgba(15, 21, 38, 0.92), rgba(8, 12, 22, 0.88));
-  backdrop-filter: blur(26px);
+  background: #ffffff;
   border-right: 1px solid var(--vdm-border);
   transition: width 0.28s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -427,16 +473,16 @@ onMounted(() => {
   place-items: center;
   border-radius: 50%;
   border: 1px solid var(--vdm-border-strong);
-  background: #0e1424;
+  background: #ffffff;
   color: var(--vdm-text-dim);
   cursor: pointer;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
   transition: all 0.18s ease;
 }
 .collapse-handle:hover {
-  color: #fff;
+  color: var(--vdm-accent);
   border-color: var(--vdm-accent);
-  box-shadow: 0 0 16px rgba(61, 125, 255, 0.6);
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.18);
 }
 
 .brand {
@@ -453,10 +499,16 @@ onMounted(() => {
   height: 38px;
   flex-shrink: 0;
   border-radius: 12px;
+  overflow: hidden;
   display: grid;
   place-items: center;
-  background: linear-gradient(135deg, #3d7dff, #22d3ee);
-  box-shadow: 0 0 22px rgba(61, 125, 255, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  box-shadow: 0 6px 16px rgba(37, 99, 235, 0.28);
+}
+.brand-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 .brand-text {
   display: flex;
@@ -469,10 +521,7 @@ onMounted(() => {
   font-size: 17px;
   font-weight: 700;
   letter-spacing: 2px;
-  background: linear-gradient(100deg, #ffffff, #a9c6ff 55%, #22d3ee);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--vdm-text);
 }
 .brand-sub {
   font-size: 10px;
@@ -489,20 +538,20 @@ onMounted(() => {
   gap: 10px;
   padding: 0 15px;
   border-radius: 12px;
-  border: 1px solid rgba(122, 162, 255, 0.4);
-  background: linear-gradient(135deg, rgba(61, 125, 255, 0.95), rgba(34, 211, 238, 0.78));
+  border: 1px solid transparent;
+  background: linear-gradient(135deg, #2563eb, #3b82f6);
   color: #fff;
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
-  box-shadow: 0 10px 26px rgba(61, 125, 255, 0.3);
+  box-shadow: 0 8px 20px rgba(37, 99, 235, 0.25);
   transition: all 0.2s ease;
 }
 .new-chat:hover {
   transform: translateY(-1px);
-  box-shadow: 0 14px 34px rgba(61, 125, 255, 0.45);
+  box-shadow: 0 12px 26px rgba(37, 99, 235, 0.34);
 }
 .new-chat:active {
   transform: translateY(0);
@@ -546,25 +595,13 @@ onMounted(() => {
   transition: all 0.16s ease;
 }
 .conv-item:hover {
-  background: rgba(122, 162, 255, 0.07);
+  background: #f4f6fa;
   color: var(--vdm-text);
 }
 .conv-item.active {
-  background: linear-gradient(90deg, rgba(61, 125, 255, 0.24), rgba(34, 211, 238, 0.06));
-  border-color: rgba(122, 162, 255, 0.32);
-  color: #fff;
-}
-.conv-item.active::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 3px;
-  height: 22px;
-  border-radius: 0 3px 3px 0;
-  background: linear-gradient(180deg, #3d7dff, #22d3ee);
-  box-shadow: 0 0 12px rgba(61, 125, 255, 0.9);
+  background: #eef4ff;
+  border-color: rgba(37, 99, 235, 0.22);
+  color: var(--vdm-accent);
 }
 .conv-icon {
   flex-shrink: 0;
@@ -611,8 +648,8 @@ onMounted(() => {
   opacity: 1;
 }
 .conv-more:hover {
-  background: rgba(122, 162, 255, 0.16);
-  color: #fff;
+  background: #e9ecf2;
+  color: var(--vdm-text);
 }
 .conv-empty {
   display: flex;
@@ -633,7 +670,7 @@ onMounted(() => {
   margin-top: auto;
   padding: 12px 14px 14px;
   border-top: 1px solid var(--vdm-border);
-  background: rgba(8, 12, 22, 0.5);
+  background: #ffffff;
 }
 /* el-dropdown 默认为 inline-flex，会收缩到内容宽度导致无法居中/溢出 */
 .sidebar-footer :deep(.el-dropdown) {
@@ -649,12 +686,29 @@ onMounted(() => {
   color: var(--vdm-text-mute);
   letter-spacing: 0.4px;
 }
+
+.storage-usage {
+  padding: 0 8px 10px;
+}
+.storage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--vdm-text-mute);
+  margin-bottom: 6px;
+}
+.storage-value {
+  color: var(--vdm-text-dim);
+  white-space: nowrap;
+}
 .status-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #2fd39f;
-  box-shadow: 0 0 9px #2fd39f;
+  background: #16a34a;
+  box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.16);
   animation: vdm-pulse 2.4s ease-in-out infinite;
 }
 .sys-ver {
@@ -674,7 +728,7 @@ onMounted(() => {
   transition: all 0.16s ease;
 }
 .user-chip:hover {
-  background: rgba(122, 162, 255, 0.09);
+  background: #f4f6fa;
   border-color: var(--vdm-border);
 }
 .avatar {
@@ -688,8 +742,8 @@ onMounted(() => {
   font-size: 15px;
   font-weight: 600;
   color: #fff;
-  background: linear-gradient(135deg, #4d6bfe, #8b5cf6);
-  box-shadow: 0 0 18px rgba(77, 107, 254, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  background: linear-gradient(135deg, #2563eb, #7c3aed);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.3);
 }
 .avatar::after {
   content: '';
@@ -699,8 +753,8 @@ onMounted(() => {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: #2fd39f;
-  border: 2px solid #0b1020;
+  background: #16a34a;
+  border: 2px solid #ffffff;
 }
 .user-info {
   flex: 1;
@@ -736,6 +790,7 @@ onMounted(() => {
 .app-shell.collapsed .conv-wrap,
 .app-shell.collapsed .user-info,
 .app-shell.collapsed .chev,
+.app-shell.collapsed .storage-usage,
 .app-shell.collapsed .sys-status {
   display: none;
 }
@@ -771,7 +826,7 @@ onMounted(() => {
   gap: 16px;
   padding: 0 26px;
   border-bottom: 1px solid var(--vdm-border);
-  background: rgba(9, 13, 24, 0.6);
+  background: rgba(255, 255, 255, 0.82);
   backdrop-filter: blur(14px);
 }
 .back-btn {
@@ -782,16 +837,16 @@ onMounted(() => {
   padding: 0 13px;
   border-radius: 10px;
   border: 1px solid var(--vdm-border);
-  background: rgba(122, 162, 255, 0.06);
+  background: #f4f5f8;
   color: var(--vdm-text-dim);
   font-size: 13px;
   cursor: pointer;
   transition: all 0.16s ease;
 }
 .back-btn:hover {
-  color: #fff;
-  border-color: var(--vdm-border-strong);
-  background: rgba(61, 125, 255, 0.16);
+  color: var(--vdm-accent);
+  border-color: rgba(37, 99, 235, 0.28);
+  background: #eef4ff;
 }
 .topbar-divider {
   width: 1px;

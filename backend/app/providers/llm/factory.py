@@ -231,7 +231,7 @@ async def test_llm_connection(
             "请只回复一个词：OK",
             system_prompt="你是一个简洁的助手",
             temperature=0.0,
-            max_tokens=10,
+            max_tokens=128,
         )
         return {
             "ok": True,

@@ -8,6 +8,7 @@ import {
   type Conversation,
 } from '@/api/chat'
 import { getCollections, type Collection } from '@/api/collection'
+import { getToken } from '@/utils/user'
 
 /** 按文档分组后的引用，用于前端展示 */
 export interface GroupedReference {
@@ -135,13 +136,16 @@ export const useChatStore = defineStore('chat', () => {
 
   async function fetchConversations() {
     loadingConversations.value = true
+    // 记录发起请求时的登录态：账号切换后丢弃过期响应，避免把上一个账号的会话显示给当前用户
+    const reqToken = getToken()
     try {
       const data = await listConversationsGlobal(1, 100)
+      if (getToken() !== reqToken) return
       conversations.value = data.items
     } catch {
       // 错误由请求拦截器统一提示
     } finally {
-      loadingConversations.value = false
+      if (getToken() === reqToken) loadingConversations.value = false
     }
   }
 
@@ -160,6 +164,14 @@ export const useChatStore = defineStore('chat', () => {
     messages.value = []
     collectionId.value = ''
     isSending.value = false
+  }
+
+  /** 清理当前登录用户的数据（退出登录/切换账号时调用，确保侧边栏不残留他人会话） */
+  function clearUserData() {
+    reset()
+    conversations.value = []
+    collections.value = []
+    loadingConversations.value = false
   }
 
   async function loadConversation(sid: string) {
@@ -372,6 +384,7 @@ export const useChatStore = defineStore('chat', () => {
     fetchConversations,
     removeConversationLocal,
     reset,
+    clearUserData,
     loadConversation,
     setCollectionId,
     clearCollection,

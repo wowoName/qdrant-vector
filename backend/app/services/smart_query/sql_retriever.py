@@ -11,7 +11,7 @@ import re
 import time
 from typing import List
 
-from sqlalchemy import select, func, and_, text as sa_text
+from sqlalchemy import select, func, and_, text as sa_text, literal_column
 
 from .base_retriever import BaseRetriever
 from .schema_provider import SchemaProvider
@@ -48,6 +48,28 @@ class SQLRetriever(BaseRetriever):
     # 列名安全校验正则（允许中文、英文字母、数字、下划线、全角/半角括号）
     # 最终安全保障是"列名必须在 schema 白名单中"，正则只是二次防护
     _COL_NAME_SAFE_RE = re.compile(r'^[\w\u4e00-\u9fa5（）()]+$')
+
+    # 常用列名映射（schema 列名 → document_records DB 索引列）
+    _RECORD_COL_MAP = {
+        "销售总监": "sales_director",
+        "总监": "sales_director",
+        "特区经理": "region_manager",
+        "大区经理": "region_manager",
+        "大区": "region",
+        "销售公司": "region",
+        "营销公司": "marketing_company",
+        "特区": "marketing_company",
+        "业务员": "salesperson",
+        "销售员": "salesperson",
+        "客商": "customer",
+        "客户": "customer",
+        "日期": "record_date",
+    }
+
+    @classmethod
+    def _record_db_col(cls, col_name: str) -> str:
+        """schema 列名转换为 DB 索引列名，返回空字符串表示走 JSON 提取"""
+        return cls._RECORD_COL_MAP.get((col_name or "").strip(), "")
 
     def is_applicable(self, plan: QueryPlan) -> bool:
         """结构化查询且有目标列时适用"""
@@ -97,31 +119,9 @@ class SQLRetriever(BaseRetriever):
         hits: List[RetrievalHit] = []
         document_id = schema.document_id
 
-        # 常用列名映射（schema 列名 → DB 索引列）
-        col_map = {
-            "销售总监": "sales_director",
-            "总监": "sales_director",
-            "特区经理": "region_manager",
-            "大区经理": "region_manager",
-            "大区": "region",
-            "销售公司": "region",
-            "营销公司": "marketing_company",
-            "特区": "marketing_company",
-            "业务员": "salesperson",
-            "销售员": "salesperson",
-            "客商": "customer",
-            "客户": "customer",
-            "日期": "record_date",
-            "销售总监 ": "sales_director",
-            "特区经理 ": "region_manager",
-            "大区 ": "region",
-            "营销公司 ": "marketing_company",
-            "业务员 ": "salesperson",
-        }
-
         def _to_db_col(col_name: str) -> str:
             """schema 列名转换为 DB 列名，返回空字符串表示走 JSON 提取"""
-            return col_map.get(col_name.strip(), "")
+            return self._record_db_col(col_name)
 
         # 构建 WHERE 条件（索引列走 ORM，其他走 JSON）
         conditions = [DocumentRecordDB.document_id == document_id]
@@ -163,6 +163,11 @@ class SQLRetriever(BaseRetriever):
 
         elif op == QueryOperation.GROUP_COUNT:
             hits = await self._group_count_records(
+                plan, conditions, json_filters, schema, top_k
+            )
+
+        elif op == QueryOperation.GROUP_AGG:
+            hits = await self._group_agg_records(
                 plan, conditions, json_filters, schema, top_k
             )
 
@@ -716,6 +721,187 @@ class SQLRetriever(BaseRetriever):
         """分组统计（简化：走列表查询）"""
         return await self._list_records(
             plan, plan.group_by, conditions, json_filters, schema, top_k
+        )
+
+    async def _group_agg_records(
+        self, plan, conditions, json_filters, schema, top_k
+    ) -> List[RetrievalHit]:
+        """分组聚合排名查询（GROUP_AGG）
+
+        生成形如：
+            SELECT <dim> AS dim, AGG(<metric>) AS metric
+            FROM document_records
+            WHERE document_id = :doc AND <filters...>
+            GROUP BY <dim>
+            ORDER BY metric DESC|ASC
+            LIMIT :n
+
+        典型："哪个业务员销售的最多"
+            → GROUP BY 业务员, SUM(销售金额), ORDER BY 2 DESC LIMIT 1
+        """
+        from app.models.db.document_record import DocumentRecordDB
+
+        schema_col_names = {c.name.strip() for c in schema.columns}
+
+        dim_col = (plan.group_by or "").strip()
+        metric_col = (plan.metric_column or "").strip()
+        agg_func = (plan.agg_func or "sum").lower()
+        if agg_func not in ("sum", "avg", "count", "max", "min"):
+            agg_func = "sum"
+
+        # ---- 维度列安全校验（必须命中 schema 白名单，防注入）----
+        if (
+            not dim_col
+            or dim_col not in schema_col_names
+            or not self._COL_NAME_SAFE_RE.match(dim_col)
+        ):
+            logger.warning(f"GROUP_AGG invalid group_by column: {dim_col!r}")
+            return [self._empty_group_agg_hit(plan, dim_col, metric_col)]
+
+        # ---- 度量列安全校验（不合法则退化为计数）----
+        if metric_col and (
+            metric_col not in schema_col_names
+            or not self._COL_NAME_SAFE_RE.match(metric_col)
+        ):
+            metric_col = ""
+        if not metric_col:
+            agg_func = "count"
+
+        # ---- 构建 WHERE 条件（索引列已由 conditions 承载，JSON 列拼入）----
+        all_conditions = list(conditions)
+        json_params = {}
+        for col, val in json_filters.items():
+            col_clean = col.strip()
+            if col_clean in schema_col_names and self._COL_NAME_SAFE_RE.match(col_clean):
+                all_conditions.append(
+                    sa_text(f"{json_text('data_json', col_clean)} = :j_{col_clean}")
+                )
+                json_params[f"j_{col_clean}"] = val
+
+        # ---- 维度表达式（索引列走 ORM，其余走 JSON）----
+        dim_db_col = self._record_db_col(dim_col)
+        if dim_db_col:
+            dim_expr = getattr(DocumentRecordDB, dim_db_col)
+        else:
+            dim_expr = literal_column(json_text("data_json", dim_col))
+
+        # 排除空的维度值（NULL / 空串），避免出现 "None" 分组
+        try:
+            all_conditions.append(dim_expr.is_not(None))
+            all_conditions.append(dim_expr != "")
+        except Exception as e:
+            logger.debug(f"GROUP_AGG add non-empty dim condition failed: {e}")
+
+        # ---- 聚合表达式 ----
+        if agg_func == "count":
+            agg_expr = func.count(DocumentRecordDB.id)
+        else:
+            metric_db_col = self._record_db_col(metric_col)
+            if metric_db_col:
+                metric_expr = getattr(DocumentRecordDB, metric_db_col)
+            else:
+                metric_expr = literal_column(json_number("data_json", metric_col))
+            agg_expr = {
+                "sum": func.sum,
+                "avg": func.avg,
+                "max": func.max,
+                "min": func.min,
+            }[agg_func](metric_expr)
+
+        order_clause = (
+            agg_expr.asc()
+            if (plan.order_dir or "DESC").upper() == "ASC"
+            else agg_expr.desc()
+        )
+
+        # ---- 返回条数：limit=0 表示全部分组（做上限保护）----
+        n = plan.limit if plan.limit and plan.limit > 0 else 200
+        n = max(1, min(n, 1000))
+
+        stmt = (
+            select(dim_expr.label("dim"), agg_expr.label("metric"))
+            .where(and_(*all_conditions))
+            .group_by(dim_expr)
+            .order_by(order_clause)
+            .limit(n)
+        )
+        result = await self.db.execute(stmt, json_params)
+        rows = result.all()
+
+        # ---- 分组总数（去重维度值）----
+        total_groups = 0
+        try:
+            cnt_stmt = (
+                select(func.count(func.distinct(dim_expr)))
+                .select_from(DocumentRecordDB)
+                .where(and_(*all_conditions))
+            )
+            total_groups = (await self.db.execute(cnt_stmt, json_params)).scalar() or 0
+        except Exception as e:
+            logger.warning(f"GROUP_AGG count distinct failed: {e}")
+            await safe_rollback(self.db)
+
+        if not rows:
+            return [self._empty_group_agg_hit(plan, dim_col, metric_col, total_groups)]
+
+        display_metric = metric_col or "记录数"
+        op_label = {
+            "sum": "合计", "avg": "平均", "count": "数量", "max": "最大", "min": "最小",
+        }.get(agg_func, "结果")
+
+        hits: List[RetrievalHit] = []
+        for i, (dim_val, metric_val) in enumerate(rows):
+            # 数值格式化（整数化、最多保留2位小数）
+            try:
+                fv = float(metric_val)
+                formatted = int(fv) if fv == int(fv) else round(fv, 2)
+            except (TypeError, ValueError):
+                formatted = metric_val if metric_val is not None else 0
+
+            hit = RetrievalHit(
+                source=RetrievalSource.SQL,
+                score=1.0,
+                content=f"{dim_col}：{dim_val}，{display_metric}{op_label}：{formatted}",
+                payload={
+                    "type": "group_agg",
+                    "group_column": dim_col,
+                    "group_value": dim_val,
+                    "metric_column": metric_col,
+                    "metric_column_alias": metric_col,
+                    "agg_func": agg_func,
+                    "order_dir": (plan.order_dir or "DESC").upper(),
+                    "value": formatted,
+                    "rank": i + 1,
+                    "filters": [(f.column, f.value) for f in plan.filters],
+                },
+                metadata={"query": "group_agg", "rank": i + 1},
+            )
+            if i == 0:
+                hit.payload["_total_groups"] = total_groups
+                hit.payload["_shown_groups"] = len(rows)
+                hit.metadata["total_groups"] = total_groups
+                hit.metadata["shown_groups"] = len(rows)
+            hits.append(hit)
+
+        return hits
+
+    @staticmethod
+    def _empty_group_agg_hit(plan, dim_col: str, metric_col: str, total_groups: int = 0) -> RetrievalHit:
+        """空的分组聚合结果（明确告知"该范围内无数据"）"""
+        return RetrievalHit(
+            source=RetrievalSource.SQL,
+            score=0.0,
+            content="",
+            payload={
+                "type": "group_agg",
+                "group_column": dim_col,
+                "metric_column": metric_col,
+                "agg_func": (plan.agg_func or "sum"),
+                "empty": True,
+                "_total_groups": total_groups,
+                "filters": [(f.column, f.value) for f in plan.filters],
+            },
+            metadata={"query": "group_agg", "total_groups": total_groups},
         )
 
     # ------------------------------------------------------------------

@@ -93,6 +93,22 @@
       <el-table-column label="最近登录" width="170">
         <template #default="{ row }">{{ formatTime(row.last_login_at) || '-' }}</template>
       </el-table-column>
+      <el-table-column label="存储空间" width="210">
+        <template #default="{ row }">
+          <span v-if="row.role === 'user'" class="never">跟随租户</span>
+          <span v-else-if="row.storage_unlimited" class="never">不限制</span>
+          <div v-else class="storage-cell">
+            <el-progress
+              :percentage="storagePercent(row)"
+              :stroke-width="6"
+              :status="storageProgressStatus(row)"
+            />
+            <span class="storage-text">
+              {{ formatSize(row.storage_used || 0) }} / {{ formatSize(row.storage_quota || 0) }}
+            </span>
+          </div>
+        </template>
+      </el-table-column>
       <el-table-column label="操作" width="230" fixed="right">
         <template #default="{ row }">
           <template v-if="row.id !== currentUserId">
@@ -157,6 +173,12 @@
           />
           <div class="form-tip">留空表示永不过期</div>
         </el-form-item>
+        <el-form-item v-if="showQuota" label="存储空间">
+          <el-input v-model="dialog.form.storage_quota_mb" placeholder="留空表示不限制">
+            <template #append>MB</template>
+          </el-input>
+          <div class="form-tip">该租户可用磁盘空间，留空表示不限制</div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialog.visible = false">{{ canSave ? '取消' : '关闭' }}</el-button>
@@ -170,7 +192,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, FormInstance, FormRules } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
-import dayjs from 'dayjs'
+import { formatAppTime, nowApp, parseAppTime } from '@/utils/datetime'
 import { createUser, deleteUser, getUserTree, updateUser, type UserTreeNode } from '@/api/admin'
 import { updateMe } from '@/api/auth'
 import { getUser, isSuperAdmin, setUser } from '@/utils/user'
@@ -201,6 +223,7 @@ const dialog = reactive({
     nickname: '',
     password: '',
     expires_at: '',
+    storage_quota_mb: '',
   },
 })
 
@@ -214,6 +237,10 @@ const isCreate = computed(() => dialog.mode === 'create')
 const showPassword = computed(() => dialog.mode !== 'editOther')
 // 过期日期只有总管理员可见/可设置：租户查看子用户时不显示（跟随租户过期）
 const showExpiry = computed(() => isSuperAdminUser.value && dialog.mode !== 'editSelf')
+// 存储空间只有总管理员可为「租户管理员」分配
+const showQuota = computed(
+  () => isSuperAdminUser.value && dialog.mode === 'editOther' && dialog.form.role === 'tenant_admin'
+)
 // 租户编辑他人时无可改字段，仅作为只读查看
 const canSave = computed(() => dialog.mode !== 'editOther' || isSuperAdminUser.value)
 
@@ -241,11 +268,33 @@ const dialogRules: FormRules = {
 }
 
 function formatTime(value?: string | null): string {
-  return value ? dayjs(value).format('YYYY-MM-DD HH:mm') : ''
+  return value ? formatAppTime(value, 'YYYY-MM-DD HH:mm') : ''
 }
 
 function isExpired(value?: string | null): boolean {
-  return !!value && dayjs(value).isBefore(dayjs())
+  const d = parseAppTime(value)
+  return !!d && d.isBefore(nowApp())
+}
+
+function formatSize(bytes: number): string {
+  if (!bytes || bytes < 0) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+function storagePercent(row: UserTreeNode): number {
+  const quota = row.storage_quota || 0
+  if (quota <= 0) return 0
+  return Math.min(100, Math.round(((row.storage_used || 0) / quota) * 100))
+}
+
+function storageProgressStatus(row: UserTreeNode): 'exception' | 'warning' | undefined {
+  const percent = storagePercent(row)
+  if (percent >= 100) return 'exception'
+  if (percent >= 85) return 'warning'
+  return undefined
 }
 
 function roleText(role: string): string {
@@ -291,7 +340,7 @@ function resetQuery() {
 function openCreateDialog() {
   dialog.mode = 'create'
   dialog.userId = ''
-  dialog.form = { email: '', role: '', nickname: '', password: '', expires_at: '' }
+  dialog.form = { email: '', role: '', nickname: '', password: '', expires_at: '', storage_quota_mb: '' }
   dialog.visible = true
 }
 
@@ -303,7 +352,9 @@ function openEditDialog(row: UserTreeNode) {
     role: row.role,
     nickname: row.nickname || '',
     password: '',
-    expires_at: row.expires_at ? dayjs(row.expires_at).format('YYYY-MM-DDTHH:mm:ss') : '',
+    expires_at: row.expires_at ? formatAppTime(row.expires_at, 'YYYY-MM-DDTHH:mm:ss') : '',
+    storage_quota_mb:
+      row.storage_quota != null ? String(+(row.storage_quota / 1024 / 1024).toFixed(2)) : '',
   }
   dialog.visible = true
 }
@@ -311,7 +362,14 @@ function openEditDialog(row: UserTreeNode) {
 function openSelfDialog(row: UserTreeNode) {
   dialog.mode = 'editSelf'
   dialog.userId = row.id
-  dialog.form = { email: row.email, role: row.role, nickname: row.nickname || '', password: '', expires_at: '' }
+  dialog.form = {
+    email: row.email,
+    role: row.role,
+    nickname: row.nickname || '',
+    password: '',
+    expires_at: '',
+    storage_quota_mb: '',
+  }
   dialog.visible = true
 }
 
@@ -330,9 +388,17 @@ async function handleSave() {
       setUser(updated)
       ElMessage.success('个人信息已更新')
     } else if (dialog.mode === 'editOther') {
-      // 编辑他人：只能设置过期日期
-      await updateUser(dialog.userId, { expires_at: dialog.form.expires_at || null })
-      ElMessage.success('过期日期已更新')
+      // 编辑他人：设置过期日期（总管理员），并为租户分配存储空间
+      const payload: {
+        expires_at: string | null
+        storage_quota?: number | null
+      } = { expires_at: dialog.form.expires_at || null }
+      if (showQuota.value) {
+        const mb = dialog.form.storage_quota_mb.trim()
+        payload.storage_quota = mb === '' ? null : Math.round(Number(mb) * 1024 * 1024)
+      }
+      await updateUser(dialog.userId, payload)
+      ElMessage.success('已更新')
     } else {
       await createUser({
         email: dialog.form.email.trim(),
@@ -371,9 +437,8 @@ onMounted(loadData)
 .page-container {
   padding: 16px;
   border-radius: var(--vdm-radius);
-  background: rgba(17, 23, 40, 0.5);
+  background: #ffffff;
   border: 1px solid var(--vdm-border);
-  backdrop-filter: blur(12px);
 }
 
 .toolbar {
@@ -397,21 +462,32 @@ onMounted(loadData)
 }
 
 .expired {
-  color: #f56c6c;
+  color: #dc2626;
 }
 
 .never {
-  color: #909399;
+  color: var(--vdm-text-mute);
 }
 
 .self-tip {
   font-size: 12px;
-  color: #909399;
+  color: var(--vdm-text-mute);
+}
+
+.storage-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.storage-text {
+  font-size: 12px;
+  color: var(--vdm-text-mute);
 }
 
 .form-tip {
   font-size: 12px;
-  color: #909399;
+  color: var(--vdm-text-mute);
   line-height: 1.4;
 }
 </style>

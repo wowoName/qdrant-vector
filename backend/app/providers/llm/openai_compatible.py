@@ -11,7 +11,10 @@ from typing import Any
 
 import httpx
 
+from app.core.logging import get_logger
 from .base import BaseLLM, ChatMessage, ChatResponse
+
+logger = get_logger(__name__)
 
 
 class OpenAICompatibleLLM(BaseLLM):
@@ -186,6 +189,20 @@ class OpenAICompatibleLLM(BaseLLM):
         reasoning = self._parse_choice_reasoning(choices[0])
         usage = self._parse_usage(data)
         model = self._parse_model(data)
+
+        # 诊断：推理模型（reasoning）会把思考算进 max_tokens，预算不足时 content 为空。
+        # 这类"静默空返回"很难排查，这里明确告警。
+        if not (content or "").strip():
+            finish_reason = choices[0].get("finish_reason")
+            detail = usage.get("completion_tokens_details") or {}
+            logger.warning(
+                "LLM 返回空内容 (model=%s, finish_reason=%s, reasoning_tokens=%s)。"
+                "若为推理模型，通常是 max_tokens 被思考过程占满，请增大 max_tokens 或改用非推理模型。",
+                model,
+                finish_reason,
+                detail.get("reasoning_tokens"),
+            )
+
         return ChatResponse(content=content, model=model, usage=usage, reasoning_content=reasoning)
 
     async def chat_stream(

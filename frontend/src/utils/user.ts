@@ -18,6 +18,12 @@ export interface UserInfo {
   created_at: string | null
   expires_at: string | null
   last_login_at: string | null
+  /** 所属租户存储配额（字节），null 表示不限制 */
+  storage_quota: number | null
+  /** 所属租户已用空间（字节） */
+  storage_used?: number
+  /** 是否不限制存储空间 */
+  storage_unlimited?: boolean
 }
 
 /** 获取 token */
