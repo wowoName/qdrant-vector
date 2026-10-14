@@ -72,25 +72,7 @@ class TextDocumentProcessor(BaseDocumentProcessor):
             strategy = cfg.get("strategy", settings.chunk_strategy)
 
             # 创建切片器
-            chunker = get_chunker(strategy)
-
-            # 动态设置 size / overlap（如果 chunker 支持这些属性）
-            if "size" in cfg and hasattr(chunker, "chunk_size"):
-                try:
-                    chunker.chunk_size = cfg["size"]
-                except Exception:
-                    pass
-            if "overlap" in cfg and hasattr(chunker, "chunk_overlap"):
-                try:
-                    chunker.chunk_overlap = cfg["overlap"]
-                except Exception:
-                    pass
-            if "min_size" in cfg and hasattr(chunker, "chunk_min_size"):
-                try:
-                    chunker.chunk_min_size = cfg["min_size"]
-                except Exception:
-                    pass
-
+            chunker = get_chunker(strategy, file_type=self._file_type or self._get_parser().supported_types()[0])
             self._chunker = chunker
         return self._chunker
 
@@ -109,7 +91,7 @@ class TextDocumentProcessor(BaseDocumentProcessor):
         chunker = self._get_chunker()
         parse_result = await self.parse(file_path)
 
-        if parse_result.pages and len(parse_result.pages) > 1:
+        if parse_result.pages:
             return chunker.chunk_with_pages(parse_result.pages)
         return chunker.chunk(parse_result.text)
 
@@ -118,7 +100,7 @@ class TextDocumentProcessor(BaseDocumentProcessor):
         chunker = self._get_chunker()
         parse_result = await self.parse(file_path)
 
-        if parse_result.pages and len(parse_result.pages) > 1:
+        if parse_result.pages:
             for c in chunker.chunk_stream_with_pages(parse_result.pages):
                 yield c
         else:

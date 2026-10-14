@@ -34,7 +34,8 @@ class RetrievalAgent:
     封装向量检索能力，为 SmartQuery 系统提供统一的检索接口。
     """
 
-    def __init__(self, vector_service: Optional[VectorService] = None, db=None):
+    def __init__(self, vector_service: Optional[VectorService] = None, db=None, visible_ids=None):
+        self.visible_ids = visible_ids
         if vector_service:
             self.vector_service = vector_service
         elif db is not None:
@@ -80,7 +81,7 @@ class RetrievalAgent:
             )
 
             search_response = await self.vector_service.search(
-                collection_id, search_req
+                collection_id, search_req, visible_ids=self.visible_ids
             )
 
             results = []

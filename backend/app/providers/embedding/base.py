@@ -9,6 +9,14 @@ from typing import List, Iterator, AsyncIterator
 class BaseEmbedding(ABC):
     """Embedding 模型抽象"""
 
+    async def prepare_chunks(self, chunks):
+        """Return indexing chunks that fit this provider's input budget."""
+        return chunks
+
+    async def validate_texts(self, texts):
+        """Validate stored inputs before a destructive index rebuild."""
+        return None
+
     @abstractmethod
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         """批量文本向量化"""

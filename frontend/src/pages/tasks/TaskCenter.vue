@@ -24,6 +24,11 @@
       </el-form>
 
       <el-table :data="tasks" v-loading="loading" stripe>
+        <el-table-column prop="file_name" label="文件名称" min-width="240" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ row.file_name || '—' }}
+          </template>
+        </el-table-column>
         <el-table-column prop="type" label="任务类型" width="150">
           <template #default="{ row }">
             {{ typeText(row.type) }}
@@ -38,6 +43,15 @@
                 :stroke-width="8"
               />
               <span class="text-sm text-gray-500">{{ (row.progress * 100).toFixed(0) }}%</span>
+            </div>
+            <div v-if="row.status === 'running'" class="text-xs text-gray-500 mt-1">
+              {{ stageText(row.progress_detail?.stage) }}
+              <span v-if="row.progress_detail?.stage === 'importing_records' && row.progress_detail?.processed_records != null">
+                · 已写入 {{ row.progress_detail.processed_records }} 条记录
+              </span>
+              <span v-else-if="row.progress_detail?.processed != null">
+                · {{ row.progress_detail.processed }}<template v-if="row.progress_detail?.total"> / {{ row.progress_detail.total }}</template>
+              </span>
             </div>
           </template>
         </el-table-column>
@@ -94,7 +108,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { formatAppTime } from '@/utils/datetime'
@@ -107,6 +121,16 @@ const pageSize = ref(20)
 const loading = ref(false)
 const filterType = ref('')
 const filterStatus = ref('')
+
+function stageText(stage?: string): string {
+  const labels: Record<string, string> = {
+    starting: '准备处理', parsing: '解析文件', chunking: '生成切片',
+    importing_records: '写入结构化记录', embedding: '生成向量',
+    writing: '写入索引', writing_db: '保存切片', writing_qdrant: '写入向量索引',
+    finalizing: '完成处理',
+  }
+  return labels[stage || ''] || stage || '处理中'
+}
 
 async function fetchTasks() {
   loading.value = true
@@ -131,7 +155,7 @@ async function fetchTasks() {
 async function handleCancel(row: any) {
   try {
     await ElMessageBox.confirm(
-      `确定要取消任务 "${row.id}" 吗？`,
+      `确定要取消任务 "${row.file_name || row.id}" 吗？`,
       '取消确认',
       { type: 'warning' }
     )
@@ -195,9 +219,16 @@ function formatDate(date: string) {
   return formatAppTime(date)
 }
 
+let refreshTimer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
   fetchTasks()
+  refreshTimer = setInterval(() => {
+    if (!loading.value && tasks.value.some(task => ['pending', 'queued', 'running'].includes(task.status))) {
+      fetchTasks()
+    }
+  }, 2000)
 })
+onUnmounted(() => clearInterval(refreshTimer))
 </script>
 
 <style scoped>

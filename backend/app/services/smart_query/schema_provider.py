@@ -22,119 +22,52 @@ from collections import OrderedDict
 
 from app.core.logging import get_logger
 
+from .semantic_packs import load_semantic_pack
 from .types import ColumnInfo, EntityInfo, TableSchema
 
 logger = get_logger(__name__)
 
 # 最大缓存表数量（LRU 淘汰），防止内存无限增长
-MAX_CACHED_TABLES = 50
+# 配置集中在 constants.py，这里只是引入
+from .constants import MAX_CACHED_TABLES  # noqa: E402
 
-# 常见层级维度列的别名映射（中文 → 层级特征词）
-HIERARCHY_KEYWORDS = {
-    "总监": 0,
-    "销售总监": 0,
-    "总经理": 0,
-    "总裁": 0,
-    "经理": 1,
-    "特区经理": 1,
-    "区域经理": 1,
-    "大区经理": 1,
-    "大区": 2,
-    "区域": 2,
-    "销售区域": 2,
-    "公司": 3,
-    "营销公司": 3,
-    "分公司": 3,
-    "办事处": 3,
-    "业务员": 4,
-    "销售人员": 4,
-    "销售代表": 4,
-    "客户": 5,
-    "客商": 5,
-    "客户名称": 5,
-}
+# ---------------------------------------------------------------------------
+# 注意：以下常量（HIERARCHY_KEYWORDS / COLUMN_ALIASES / COUNT_KEYWORDS 等）
+# 已迁移到 semantic_packs/ 目录下的 YAML 配置文件。
+# 这里保留一份模块级的"运行时加载值"，作为向后兼容的快捷访问。
+# 新代码请通过 SchemaProvider 实例的语义包属性访问，
+# 或者直接使用 semantic_packs.load_semantic_pack()。
+# ---------------------------------------------------------------------------
 
-# 常见维度列的同义词/别名
-COLUMN_ALIASES = {
-    "销售总监": ["总监", "销售总监", "负责人", "领导", "老大", "老板"],
-    "特区经理": ["经理", "特区经理", "区域经理", "主管"],
-    "销售经理": [
-        "销售经理",
-        "客户经理",
-        "销售人员",
-        "销售代表",
-        "销售",
-        "人员",
-        "业务员",
-        "销售员",
-        "经理",
-    ],
-    "大区": ["大区", "区域", "销售大区", "销售区域"],
-    "营销公司": ["公司", "营销公司", "分公司", "办事处"],
-    "业务员": ["业务员", "销售人员", "销售代表", "销售", "人员"],
-    "客户": ["客户", "客商", "客户名称", "客户公司"],
-    "公司名称": ["公司", "公司名称", "企业名称", "单位"],
-    "库存组织": ["库存组织", "仓库", "库存"],
-    "合同类型": ["合同类型", "合同"],
-    "要货日期": ["要货日期", "下单日期", "订单日期"],
-    "发货日期": ["发货日期", "出货日期", "送货日期"],
-}
+# 当前加载的语义包名称（默认使用销售行业，与历史行为一致）
+_current_pack_name: str = "sales"
+_pack_loaded: dict = {}
 
-# 数量/统计相关的关键词（用于识别统计类问题）
-COUNT_KEYWORDS = [
-    "多少",
-    "几个",
-    "数量",
-    "总数",
-    "总计",
-    "合计",
-    "统计",
-    "有多少",
-    "多少个",
-    "多少人",
-    "多少名",
-    "共多少",
-    "总共有",
-]
 
-LIST_KEYWORDS = [
-    "有哪些",
-    "哪些",
-    "列出",
-    "列表",
-    "名单",
-    "明细",
-    "详情",
-    "分别是",
-    "都是谁",
-    "都有谁",
-    "包括哪些",
-    "包含哪些",
-]
+def _get_pack() -> dict:
+    """懒加载默认语义包"""
+    global _pack_loaded
+    if not _pack_loaded:
+        _pack_loaded = load_semantic_pack(_current_pack_name)
+    return _pack_loaded
 
-GROUP_KEYWORDS = [
-    "每个",
-    "各个",
-    "分别",
-    "按",
-    "分组",
-    "每个...多少",
-    "各有多少",
-]
 
-TOP_KEYWORDS = [
-    "top",
-    "前",
-    "排名",
-    "最高",
-    "最多",
-    "最大",
-    "第一名",
-    "前三",
-    "前十",
-    "前10",
-    "前20",
-]
+# 向后兼容：导出旧的常量名，值来自默认语义包
+def __getattr__(name):
+    """模块级 __getattr__：兼容旧的常量导入方式"""
+    if name == "HIERARCHY_KEYWORDS":
+        return _get_pack()["hierarchy_levels"]
+    if name == "COLUMN_ALIASES":
+        return _get_pack()["column_aliases"]
+    if name == "COUNT_KEYWORDS":
+        return _get_pack()["intent_keywords"]["count"]
+    if name == "LIST_KEYWORDS":
+        return _get_pack()["intent_keywords"]["list"]
+    if name == "GROUP_KEYWORDS":
+        return _get_pack()["intent_keywords"]["group"]
+    if name == "TOP_KEYWORDS":
+        return _get_pack()["intent_keywords"]["top"]
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 class SchemaProvider:
@@ -144,13 +77,65 @@ class SchemaProvider:
     从 Excel/CSV 文件中提取结构化元数据，供 SQLAgent 和 RouterAgent 使用。
     """
 
-    def __init__(self, max_cached_tables: int = MAX_CACHED_TABLES):
+    def __init__(
+        self,
+        max_cached_tables: int = MAX_CACHED_TABLES,
+        industry: str = "sales",
+    ):
+        """
+        Args:
+            max_cached_tables: 最大缓存表数量（LRU 淘汰）
+            industry: 业务语义包名称，默认 "sales"（销售行业）
+                     可用值见 semantic_packs/ 目录下的 .yaml 文件
+        """
         self._schema_cache: dict[str, TableSchema] = {}
         self._entities_cache: dict[str, list[EntityInfo]] = {}
         self._duckdb_conn = None
         # LRU 缓存：cache_key -> table_name，OrderedDict 实现 LRU
         self._table_lru: OrderedDict[str, str] = OrderedDict()
         self._max_cached_tables = max_cached_tables
+
+        # 加载业务语义包
+        self._industry = industry
+        self._semantic_pack = load_semantic_pack(industry)
+        logger.info(f"SchemaProvider initialized with semantic pack: '{industry}'")
+
+    @property
+    def semantic_pack(self) -> dict:
+        """当前使用的业务语义包"""
+        return self._semantic_pack
+
+    @property
+    def industry(self) -> str:
+        """当前语义包名称"""
+        return self._industry
+
+    @property
+    def hierarchy_levels(self) -> dict:
+        """层级维度配置（等价于旧的 HIERARCHY_KEYWORDS）"""
+        return self._semantic_pack["hierarchy_levels"]
+
+    @property
+    def column_aliases(self) -> dict:
+        """列名同义词配置（等价于旧的 COLUMN_ALIASES）"""
+        return self._semantic_pack["column_aliases"]
+
+    @property
+    def intent_keywords(self) -> dict:
+        """查询意图关键词配置"""
+        return self._semantic_pack["intent_keywords"]
+
+    def switch_industry(self, industry: str) -> None:
+        """切换业务语义包（运行时切换，清除相关缓存）"""
+        if industry == self._industry:
+            return
+        self._semantic_pack = load_semantic_pack(industry)
+        self._industry = industry
+        # 语义包变了，schema 中的语义标签可能也变了，清空缓存
+        self._schema_cache.clear()
+        self._entities_cache.clear()
+        self._table_lru.clear()
+        logger.info(f"SchemaProvider switched to semantic pack: '{industry}'")
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -265,8 +250,8 @@ class SchemaProvider:
         if not kw_normalized:
             return None
 
-        # 先从全局别名表查找
-        for col_name, aliases in COLUMN_ALIASES.items():
+        # 先从全局别名表查找（来自语义包）
+        for col_name, aliases in self.column_aliases.items():
             if kw_normalized in [self._normalize_text(a) for a in aliases]:
                 col = schema.find_column_by_alias(col_name)
                 if col:
@@ -471,6 +456,13 @@ class SchemaProvider:
                 except Exception:
                     pass
 
+                # 推断语义类型（基于列名 + 数据类型 + 样本值）
+                col_info.semantic_type = self._infer_semantic_type(
+                    col_name=col_name,
+                    data_type=data_type,
+                    sample_values=col_info.sample_values,
+                )
+
                 columns.append(col_info)
 
             schema = TableSchema(
@@ -567,8 +559,8 @@ class SchemaProvider:
         """
         col_normalized = self._normalize_text(col_name)
 
-        # 先检查全局层级关键词
-        for keyword, level in HIERARCHY_KEYWORDS.items():
+        # 先检查语义包中的层级关键词
+        for keyword, level in self.hierarchy_levels.items():
             if keyword in col_normalized:
                 return True, level
 
@@ -615,9 +607,9 @@ class SchemaProvider:
         """获取列的别名列表"""
         col_normalized = self._normalize_text(col_name)
 
-        # 从全局别名表反向查找
+        # 从语义包的别名表反向查找
         aliases = []
-        for std_name, alias_list in COLUMN_ALIASES.items():
+        for std_name, alias_list in self.column_aliases.items():
             if col_normalized == self._normalize_text(std_name):
                 aliases.extend(alias_list)
                 break
@@ -659,3 +651,204 @@ class SchemaProvider:
         text = text.lower()
 
         return text
+
+    # ------------------------------------------------------------------
+    # 语义类型推断
+    # ------------------------------------------------------------------
+
+    def _infer_semantic_type(
+        self,
+        col_name: str,
+        data_type: str,
+        sample_values: list[str],
+        unique_ratio: float | None = None,
+    ) -> str:
+        """
+        根据列名、数据类型、样本值推断列的语义类型（SemanticType）。
+
+        推断优先级：
+        1. 数据类型强判断（DATE → TIME，BOOLEAN → CATEGORY 等）
+        2. 列名关键词匹配（中文 + 英文常见词）
+        3. 样本值数据特征兜底（唯一值少 → CATEGORY，含"公司/有限公司" → ORGANIZATION 等）
+
+        Args:
+            col_name: 列名
+            data_type: DuckDB 返回的数据类型（大写，如 VARCHAR / INTEGER / DATE）
+            sample_values: 样本值列表
+            unique_ratio: 唯一值比例（可选，用于辅助判断 CATEGORY）
+
+        Returns:
+            SemanticType 枚举值字符串
+        """
+        from .types import SemanticType
+
+        name_lower = col_name.lower()
+        dt_upper = data_type.upper()
+
+        # ---- 1. 数据类型强判断 ----
+        if dt_upper in ("DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "DATETIME", "TIME"):
+            return SemanticType.TIME
+        if dt_upper in ("BOOLEAN", "BOOL"):
+            return SemanticType.CATEGORY
+
+        # 数值类 → 区分 AMOUNT / QUANTITY / ID
+        if dt_upper in ("INTEGER", "BIGINT", "SMALLINT", "TINYINT",
+                        "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL"):
+            # 列名带金额关键词 → AMOUNT
+            amount_keywords = [
+                "金额", "销售额", "销售金额", "利润", "费用", "收入", "成本",
+                "价格", "单价", "总额", "合计", "总计", "价款", "金额",
+                "amount", "price", "cost", "revenue", "profit", "sales",
+                "total", "fee", "money", "sum", "value",
+            ]
+            for kw in amount_keywords:
+                if kw in name_lower:
+                    return SemanticType.AMOUNT
+
+            # 列名带 ID/编号 关键词 → ID
+            id_keywords = [
+                "编号", "工号", "单号", "序号", "编码", "号",
+                "id", "code", "no", "sn", "num",
+            ]
+            # 注意："号" 单独太泛，只有在列名较短时才算（如 "订单号"）
+            for kw in id_keywords:
+                if kw == "号":
+                    if name_lower.endswith("号") and len(name_lower) <= 6:
+                        return SemanticType.ID
+                    continue
+                if kw in name_lower:
+                    return SemanticType.ID
+
+            # 其余数值 → QUANTITY
+            return SemanticType.QUANTITY
+
+        # ---- 2. 列名关键词匹配（VARCHAR 等字符串列） ----
+        # PERSON
+        person_keywords = [
+            "姓名", "员工", "业务员", "销售员", "销售", "联系人", "人员",
+            "经理", "总监", "主任", "主管", "负责人", "领导", "客户姓名",
+            "名字", "代表", "顾问", "工程师",
+            "name", "person", "people", "employee", "staff", "contact",
+            "salesperson", "salesman", "manager", "director", "leader",
+        ]
+        for kw in person_keywords:
+            if kw in name_lower:
+                return SemanticType.PERSON
+
+        # ORGANIZATION
+        org_keywords = [
+            "公司", "客户", "供应商", "部门", "单位", "机构", "企业",
+            "厂商", "品牌", "客户名称", "公司名称", "供应商名称",
+            "组织", "集团", "工厂", "办事处", "分公司", "事业部",
+            "company", "organization", "department", "dept", "customer",
+            "vendor", "supplier", "org", "brand", "factory", "division",
+        ]
+        for kw in org_keywords:
+            if kw in name_lower:
+                return SemanticType.ORGANIZATION
+
+        # LOCATION
+        location_keywords = [
+            "城市", "地区", "地址", "省份", "国家", "区域", "地点",
+            "省市", "大区", "片区", "省", "市", "区", "县",
+            "city", "province", "address", "region", "area", "location",
+            "country", "place", "zone", "district",
+        ]
+        for kw in location_keywords:
+            if kw in name_lower:
+                return SemanticType.LOCATION
+
+        # TIME（字符串形式的时间列，如 "月份"、"年份"）
+        time_keywords = [
+            "日期", "时间", "月份", "年份", "季度", "周", "星期",
+            "年月", "年度", "月度", "周期",
+            "date", "time", "month", "year", "quarter", "week", "period",
+        ]
+        for kw in time_keywords:
+            if kw in name_lower:
+                return SemanticType.TIME
+
+        # AMOUNT（字符串存储的金额，如带货币符号）
+        amount_keywords_str = [
+            "金额", "销售额", "销售金额", "利润", "费用", "收入", "成本",
+            "价格", "单价", "总额", "合计", "总计",
+            "amount", "price", "cost", "revenue", "profit", "sales",
+            "total", "fee",
+        ]
+        for kw in amount_keywords_str:
+            if kw in name_lower:
+                return SemanticType.AMOUNT
+
+        # QUANTITY（字符串存储的数量）
+        qty_keywords = [
+            "数量", "个数", "件数", "重量", "百分比", "比例", "比率",
+            "数量", "台数", "人数", "次数",
+            "quantity", "count", "number", "weight", "percent", "ratio",
+            "qty", "num",
+        ]
+        for kw in qty_keywords:
+            if kw in name_lower:
+                return SemanticType.QUANTITY
+
+        # ID
+        id_keywords_str = [
+            "编号", "ID", "工号", "单号", "编码", "序号", "证件号",
+            "身份证", "电话", "手机", "邮箱",
+            "id", "code", "no", "sn", "uuid",
+        ]
+        for kw in id_keywords_str:
+            if kw.lower() in name_lower:
+                return SemanticType.ID
+
+        # CATEGORY
+        cat_keywords = [
+            "类型", "状态", "等级", "级别", "类别", "分类", "性别",
+            "种类", "性质", "阶段", "渠道", "方式", "模式", "标签",
+            "type", "status", "level", "category", "class", "gender",
+            "kind", "phase", "channel", "mode", "tag", "flag",
+        ]
+        for kw in cat_keywords:
+            if kw in name_lower:
+                return SemanticType.CATEGORY
+
+        # ---- 3. 样本值兜底判断 ----
+        if sample_values:
+            # 含"公司/有限公司/集团/分公司/工厂" → ORGANIZATION
+            org_markers = ["公司", "有限公司", "集团", "分公司", "工厂", "办事处", "事业部"]
+            if any(any(m in v for m in org_markers) for v in sample_values if v):
+                return SemanticType.ORGANIZATION
+
+            # 含"省/市/区/县"且长度适中 → LOCATION
+            loc_markers = ["省", "市", "区", "县", "地区", "城市"]
+            if any(any(m in v for m in loc_markers) for v in sample_values if v):
+                return SemanticType.LOCATION
+
+            # 日期格式样本 → TIME
+            import re
+            date_pattern = re.compile(r"^\d{4}[-/.年]\d{1,2}[-/.月]?\d{0,2}日?$")
+            if any(date_pattern.match(str(v).strip()) for v in sample_values[:5] if v):
+                return SemanticType.TIME
+
+            # 唯一值很少 → CATEGORY（如果传了 unique_ratio 或从样本判断）
+            if len(sample_values) >= 3 and len(set(sample_values)) <= min(10, len(sample_values) // 2):
+                # 再排除像人名的（2-4个中文字符，且不含分类词）
+                def _is_like_name(s: str) -> bool:
+                    s = s.strip()
+                    if 2 <= len(s) <= 4 and all("\u4e00" <= c <= "\u9fff" for c in s):
+                        return True
+                    return False
+
+                name_like_count = sum(1 for v in sample_values if _is_like_name(v))
+                if name_like_count < len(sample_values) * 0.5:
+                    return SemanticType.CATEGORY
+
+            # 字符串看起来像人名（短中文 + 高基数）→ PERSON
+            name_like_count = sum(
+                1 for v in sample_values
+                if v.strip() and 2 <= len(v.strip()) <= 4
+                and all("\u4e00" <= c <= "\u9fff" for c in v.strip())
+            )
+            if len(sample_values) >= 3 and name_like_count >= len(sample_values) * 0.7:
+                return SemanticType.PERSON
+
+        return SemanticType.OTHER

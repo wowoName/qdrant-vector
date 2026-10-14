@@ -1275,13 +1275,16 @@ class ChatService:
     # ========== 内部方法 ==========
 
     async def _load_history(
-        self, conv_id: str, session_id: str, strip_warning: bool = False
+        self, conv_id: str, session_id: str, strip_warning: bool = False,
+        strip_links: bool = True,
     ) -> list[dict]:
         """加载历史消息为 dict 列表（供上下文管理器使用）
 
         Args:
             strip_warning: 是否移除 assistant 消息末尾的非知识库警示信息，
                            用于问题改写等场景，避免警示语干扰改写质量。
+            strip_links: 是否移除 assistant 消息中的下载链接 / Markdown 链接，
+                         链接类内容对下一轮上下文理解无意义，还会占用 token。
         """
         msgs = await self.conv_repo.get_messages(conv_id, session_id)
         result = []
@@ -1292,6 +1295,8 @@ class ChatService:
                 idx = content.rfind(NON_KB_WARNING.strip())
                 if idx > 0:
                     content = content[:idx].rstrip()
+            if strip_links and m.role == "assistant":
+                content = self._strip_links_from_content(content)
             result.append(
                 {
                     "seq": m.seq,
@@ -1303,6 +1308,49 @@ class ChatService:
                 }
             )
         return result
+
+    @staticmethod
+    def _strip_links_from_content(content: str) -> str:
+        """
+        从 assistant 消息中移除下载链接 / Markdown 链接等对上下文无意义的内容。
+
+        移除范围：
+        1. 完整的下载提示段落（"📄 ... 已超出页面展示范围，[点击下载...](url) ..."）
+        2. 纯 Markdown 链接（参考引用类链接）→ 保留链接文本，去掉 URL
+        3. 裸 URL（http/https 开头的独立链接）
+        """
+        import re
+
+        if not content:
+            return content
+
+        # 1. 移除下载提示整段（以 📄 开头，到段尾）
+        # 匹配：📄 开头，包含"下载"和 URL 的整段内容
+        content = re.sub(
+            r"\n*📄[^\n]*下载[^\n]*\n*",
+            "\n",
+            content,
+        )
+
+        # 2. Markdown 链接：[文本](url) → 保留文本（去掉 URL 部分）
+        # 只处理 http/https / 相对路径的链接
+        content = re.sub(
+            r"\[([^\]]+)\]\((https?://[^\s)]+|/[^\s)]+)\)",
+            r"\1",
+            content,
+        )
+
+        # 3. 裸 URL（独立出现的 http/https 链接）
+        content = re.sub(
+            r"\bhttps?://\S+",
+            "",
+            content,
+        )
+
+        # 清理多余空行
+        content = re.sub(r"\n{3,}", "\n\n", content).strip()
+
+        return content
 
     async def _save_turn(
         self,
@@ -1465,7 +1513,7 @@ class ChatService:
 
         effective = apply_delta(prev_state, delta)
 
-        if delta.reset_all or delta.remove_columns:
+        if delta.reset_all or delta.remove_columns or delta.operation == "new_query":
             # 约束重置：即使本轮最终没有任何过滤条件，也要把裁剪后的状态落库，
             # 否则会回退到旧状态（"不限制客户"失效）
             try:
@@ -1598,6 +1646,17 @@ class ChatService:
 
             # 判断是否应该使用 SmartQuery 的结果
             use_result = False
+
+            # 拆解失败提示必须回传，避免回退到 RAG 后掩盖失败。
+            if result.debug_info.get("decomposition", {}).get("error"):
+                return {
+                    "success": True,
+                    "answer": result.final_answer,
+                    "references": [],
+                    "is_kb_answer": False,
+                    "used_sql": False,
+                    "model": "smart-query",
+                }
 
             # 情况1：SQL 查询成功且有数据
             if (

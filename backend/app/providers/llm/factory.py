@@ -68,7 +68,7 @@ def _get_default_model(provider: str) -> str:
     """获取指定 provider 的默认模型
 
     优先级：
-    1. 各 provider 的专属配置（如 ark_model_endpoint、ollama_model 等）
+    1. 各 provider 的专属配置（如 ollama_model）
     2. 全局 llm_model（仅当 provider 与全局 llm_provider 一致时）
     3. 内置默认值
     """
@@ -76,7 +76,6 @@ def _get_default_model(provider: str) -> str:
 
     # 有专属配置的 provider 优先使用专属配置
     dedicated = {
-        "ark": (settings.ark_model_endpoint or "").strip(),
         "ollama": (settings.ollama_model or "").strip(),
     }
     if provider_lower in dedicated and dedicated[provider_lower]:
@@ -127,10 +126,10 @@ def _create_llm_internal(provider: str, model: str) -> BaseLLM:
 
 def _create_ark_llm(model: str) -> ArkLLM:
     """创建火山方舟 LLM 实例"""
-    actual_model = (model or settings.ark_model_endpoint or "").strip()
+    actual_model = (model or "").strip()
     if not actual_model:
         raise ValueError(
-            "火山方舟模型未配置，请设置 ARK_MODEL_ENDPOINT 环境变量 "
+            "火山方舟模型未配置，请在 LLM_PROVIDER=ark 时设置 LLM_MODEL，或设置对应场景的 *_LLM_MODEL "
             "(需使用控制台的 Model ID 或 Endpoint ID，如 doubao-seed-2-1-pro-260628 / ep-xxxxx)"
         )
 

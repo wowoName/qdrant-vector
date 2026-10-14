@@ -5,7 +5,7 @@ HuggingFace 本地 Embedding 模型
 
 import asyncio
 import os
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -20,6 +20,7 @@ class HuggingFaceEmbedding(BaseEmbedding):
 
     _instance: Optional["HuggingFaceEmbedding"] = None
     _model_name: str | None = None
+    _instance_lock = asyncio.Lock()
 
     def __init__(self, model_name: str, device: str = "auto", cache_dir: str | None = None):
         self._model_name = model_name
@@ -31,15 +32,17 @@ class HuggingFaceEmbedding(BaseEmbedding):
     @classmethod
     async def get_instance(cls) -> "HuggingFaceEmbedding":
         """获取单例"""
-        if cls._instance is None or cls._model_name != settings.embedding_model:
-            instance = cls(
-                model_name=settings.embedding_model,
-                device=settings.embedding_device,
-                cache_dir=settings.embedding_cache_dir,
-            )
-            await instance._load_model()
-            cls._instance = instance
-            cls._model_name = settings.embedding_model
+        async with cls._instance_lock:
+            # 加载期间其他调用必须等待，并在取得锁后重新检查缓存。
+            if cls._instance is None or cls._model_name != settings.embedding_model:
+                instance = cls(
+                    model_name=settings.embedding_model,
+                    device=settings.embedding_device,
+                    cache_dir=settings.embedding_cache_dir,
+                )
+                await instance._load_model()
+                cls._instance = instance
+                cls._model_name = settings.embedding_model
         return cls._instance
 
     async def _load_model(self) -> None:
@@ -47,7 +50,7 @@ class HuggingFaceEmbedding(BaseEmbedding):
         if self._model is not None:
             return
 
-        logger.info(f"Loading embedding model: {self._model_name}")
+        logger.info(f"Loading embedding model: {self._model_name} (pid={os.getpid()})")
 
         # 设置缓存目录
         if self._cache_dir:
@@ -84,7 +87,7 @@ class HuggingFaceEmbedding(BaseEmbedding):
 
             if local_path:
                 # 本地模式：直接加载，不碰网络
-                logger.info(f"Loading embedding model from local path: {local_path}")
+                logger.info(f"Loading embedding model from local path: {local_path} (pid={os.getpid()})")
                 model = SentenceTransformer(
                     model_name_or_path=local_path,
                     device=device,
@@ -222,6 +225,32 @@ class HuggingFaceEmbedding(BaseEmbedding):
 
         return missing
 
+    async def prepare_chunks(self, chunks):
+        if self._model is None:
+            await self._load_model()
+        from app.utils.embedding_chunks import split_chunks_by_tokens
+        prepared = await asyncio.to_thread(
+            split_chunks_by_tokens, chunks, self._model.tokenizer,
+            self._model.max_seq_length,
+        )
+        if len(prepared) != len(chunks):
+            logger.info("Token budget split: %s source chunks -> %s embedding chunks (limit=%s)",
+                        len(chunks), len(prepared), self._model.max_seq_length)
+        return prepared
+
+    def _check_input_lengths(self, texts):
+        # Every caller, including reindex/sync paths, must not silently truncate.
+        lengths = self._model.tokenizer(texts, add_special_tokens=True, truncation=False)["input_ids"]
+        if any(len(tokens) > self._model.max_seq_length for tokens in lengths):
+            raise ValueError(
+                f"Embedding 输入超过 {self._model.max_seq_length} tokens；请先按模型 tokenizer 分片，禁止静默截断"
+            )
+
+    async def validate_texts(self, texts):
+        if self._model is None:
+            await self._load_model()
+        await asyncio.to_thread(self._check_input_lengths, texts)
+
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """批量向量化"""
         if not texts:
@@ -230,6 +259,7 @@ class HuggingFaceEmbedding(BaseEmbedding):
         if self._model is None:
             await self._load_model()
 
+        await self.validate_texts(texts)
         batch_size = self._get_optimal_batch_size(texts)
 
         def _encode(texts_batch: list[str]) -> list[list[float]]:
@@ -266,6 +296,7 @@ class HuggingFaceEmbedding(BaseEmbedding):
         if self._model is None:
             await self._load_model()
 
+        await self.validate_texts(texts)
         if batch_size is None:
             batch_size = self._get_optimal_batch_size(texts)
 

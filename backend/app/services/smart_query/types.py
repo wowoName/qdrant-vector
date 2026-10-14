@@ -65,6 +65,44 @@ class QueryOperation(str, Enum):
     """未知操作"""
 
 
+class SemanticType(str, Enum):
+    """
+    列的语义类型（用于跨表实体对齐和实体识别优化）。
+
+    由规则法在 schema 提取阶段自动推断，供下游模块使用：
+    - 跨表差异检测（优先按 semantic_type 对齐列）
+    - 全局实体识别（知道某列存的是人/机构/地点等）
+    - 多子任务优化（实体 → 候选列预过滤）
+    """
+
+    PERSON = "person"
+    """人物：姓名、员工、客户联系人等"""
+
+    ORGANIZATION = "organization"
+    """组织/机构：公司、部门、客户名称、供应商等"""
+
+    LOCATION = "location"
+    """地点：城市、地区、地址等"""
+
+    TIME = "time"
+    """时间：日期、月份、年份、季度等"""
+
+    AMOUNT = "amount"
+    """金额：销售额、利润、费用等（货币类数值）"""
+
+    QUANTITY = "quantity"
+    """数量：个数、件数、重量、百分比等（非货币类数值）"""
+
+    ID = "id"
+    """标识符：编号、ID、工号、订单号等"""
+
+    CATEGORY = "category"
+    """分类/枚举：性别、状态、类型、等级等有限取值列"""
+
+    OTHER = "other"
+    """其他/未识别"""
+
+
 @dataclass
 class ColumnInfo:
     """列信息"""
@@ -89,6 +127,9 @@ class ColumnInfo:
 
     hierarchy_level: int = 0
     """层级级别，数值越小级别越高（0=最高层）"""
+
+    semantic_type: str = SemanticType.OTHER
+    """列的语义类型（SemanticType 枚举），用于跨表实体对齐和实体识别优化"""
 
 
 @dataclass

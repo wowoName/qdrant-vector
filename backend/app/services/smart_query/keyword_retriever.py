@@ -16,6 +16,7 @@ from typing import List, Optional
 from sqlalchemy import select, and_, or_, text as sa_text
 
 from .base_retriever import BaseRetriever
+from .constants import KEYWORD_RETRIEVER_STOPWORDS
 from .types import (
     QueryPlan,
     RetrievalHit,
@@ -95,12 +96,9 @@ class KeywordRetriever(BaseRetriever):
                     keywords.append(ent.name)
 
         # 从查询中提取（简单分词：去掉常见停用词）
-        stop_words = {
-            "多少", "几个", "什么", "怎么", "哪些", "哪里", "哪个",
-            "有多少", "有哪些", "是什么", "怎么样", "为什么",
-            "吗", "呢", "啊", "吧", "了", "的", "和", "与",
-            "手下", "里面", "当中", "其中",
-        }
+        # 停用词集中在 constants.KEYWORD_RETRIEVER_STOPWORDS 管理
+        stop_words = KEYWORD_RETRIEVER_STOPWORDS["full_words"]
+        question_words = KEYWORD_RETRIEVER_STOPWORDS["question_words"]
 
         # 简单处理：按常见分隔符切分
         import re
@@ -109,7 +107,7 @@ class KeywordRetriever(BaseRetriever):
             w = w.strip()
             if len(w) >= 2 and w not in stop_words:
                 # 去掉包含疑问词的
-                if not any(sw in w for sw in ["多少", "什么", "怎么", "哪些", "哪里", "哪个"]):
+                if not any(sw in w for sw in question_words):
                     if w not in keywords:
                         keywords.append(w)
 
@@ -121,6 +119,7 @@ class KeywordRetriever(BaseRetriever):
     ) -> List[RetrievalHit]:
         """在 PostgreSQL 中做 LIKE 关键词搜索"""
         from app.models.db.document_record import DocumentRecordDB
+        from app.models.db.document import DocumentDB
 
         hits: List[RetrievalHit] = []
         document_id = schema.document_id
@@ -140,28 +139,29 @@ class KeywordRetriever(BaseRetriever):
 
         # 计算匹配度（命中的关键词越多得分越高）
         stmt = (
-            select(DocumentRecordDB)
+            select(DocumentRecordDB, DocumentDB.name)
+            .join(DocumentDB, DocumentDB.id == DocumentRecordDB.document_id)
             .where(and_(*conditions))
             .order_by(DocumentRecordDB.row_number)
             .limit(top_k * 2)  # 多取一些，后面按匹配度排序
         )
 
         result = await self.db.execute(stmt)
-        records = list(result.scalars().all())
+        records = list(result.all())
 
         # 按关键词匹配数量排序（简单打分）
         scored = []
-        for rec in records:
+        for rec, document_name in records:
             text = rec.vector_text or ""
             match_count = sum(1 for kw in keywords if kw in text)
             if match_count > 0:
                 score = match_count / len(keywords)  # 0-1 范围
-                scored.append((score, rec))
+                scored.append((score, rec, document_name))
 
         # 按得分降序排序
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        for i, (score, rec) in enumerate(scored[:top_k]):
+        for i, (score, rec, document_name) in enumerate(scored[:top_k]):
             hit = RetrievalHit(
                 source=RetrievalSource.KEYWORD,
                 score=score,
@@ -172,6 +172,8 @@ class KeywordRetriever(BaseRetriever):
                 content=rec.vector_text or "",
                 payload=rec.data,
                 metadata={
+                    "table_name": document_name,
+                    "collection_id": rec.collection_id,
                     "matched_keywords": [kw for kw in keywords if kw in (rec.vector_text or "")],
                     "keyword_match_count": int(score * len(keywords)),
                 },

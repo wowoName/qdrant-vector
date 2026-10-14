@@ -27,7 +27,8 @@ class MarkdownParser(BaseParser):
         content, encoding = read_text_file(file_path)
 
         content = normalize_text(content)
-        content = clean_whitespace(content)
+        # Indentation is content in Markdown lists and fenced code blocks.
+        content = content.strip()
 
         # 按二级标题分块（作为 pages）
         pages = self._split_by_headings(content)

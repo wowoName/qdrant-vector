@@ -65,7 +65,7 @@ class HTMLParser(BaseParser):
         # 将 heading 作为 section 分隔符
         for element in article.find_all(["h1", "h2", "h3", "p", "li", "td", "th", "pre", "blockquote"]):
             tag_name = element.name
-            text = element.get_text(strip=True)
+            text = element.get_text() if element.name == "pre" else element.get_text(" ", strip=True)
             if not text:
                 continue
 
@@ -110,6 +110,10 @@ class HTMLParser(BaseParser):
                 pages = [full_text]
 
         # 全文
+        if not pages:
+            fallback = article.get_text("\n", strip=True)
+            if fallback:
+                pages = [fallback]
         full_text = "\n\n".join(pages)
         full_text = normalize_text(full_text)
         full_text = clean_whitespace(full_text)

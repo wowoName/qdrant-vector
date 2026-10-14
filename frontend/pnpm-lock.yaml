@@ -12,8 +12,8 @@ importers:
         specifier: ^2.3.0
         version: 2.3.2(vue@3.5.43(typescript@5.9.3))
       '@eternalheart/vue-file-preview':
-        specifier: ^1.6.8
-        version: 1.6.8(vue@3.5.43(typescript@5.9.3))
+        specifier: ^1.6.9
+        version: 1.6.9(vue@3.5.43(typescript@5.9.3))
       axios:
         specifier: ^1.7.0
         version: 1.20.0
@@ -96,8 +96,8 @@ packages:
     peerDependencies:
       vue: ^3.2.0
 
-  '@eternalheart/vue-file-preview@1.6.8':
-    resolution: {integrity: sha512-ojHY3elpB3Z59qAxcNJTCIXQornICMyNHGh7t7UMk1edebEInUnAfbGi02RSWwgSjWpoEoAZj0n5zEOKJfdLhg==}
+  '@eternalheart/vue-file-preview@1.6.9':
+    resolution: {integrity: sha512-xnEknisNDjl3FSBulR9LJIEKZYMn68SWmKL7hDX2adOXsK6mKbMAQyTINGoQlScZZZW5LF8Vhz/Fk2dmEBaXGA==}
     peerDependencies:
       vue: ^3.4.0
 
@@ -1872,7 +1872,7 @@ snapshots:
     dependencies:
       vue: 3.5.43(typescript@5.9.3)
 
-  '@eternalheart/vue-file-preview@1.6.8(vue@3.5.43(typescript@5.9.3))':
+  '@eternalheart/vue-file-preview@1.6.9(vue@3.5.43(typescript@5.9.3))':
     dependencies:
       '@jsquash/avif': 2.1.1
       '@kenjiuno/msgreader': 1.28.0

@@ -1,4 +1,4 @@
-"""
+r"""
 重建向量索引脚本
 从 PostgreSQL 数据库读取所有 chunk，重新生成 embedding 并写入 Qdrant
 
@@ -9,18 +9,19 @@
 """
 
 import asyncio
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.database import async_session
 from app.models.db.collection import CollectionDB
-from app.models.db.document import DocumentDB, DocumentVersionDB, ChunkDB
+from app.models.db.document import ChunkDB, DocumentDB
 from app.providers.embedding.factory import get_embedding
 from app.repositories.qdrant_repo import get_qdrant
-from sqlalchemy import select
 
 # 批次大小（一次向量化多少个 chunk）
 BATCH_SIZE = 32
@@ -31,19 +32,38 @@ async def rebuild_collection(collection_id: str, collection_name: str, vector_di
     qdrant = get_qdrant()
     embedding = await get_embedding()
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"重建知识库: {collection_name} ({collection_id})")
     print(f"向量维度: {vector_dim}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
+
+    # Validate persisted text before deleting a working collection. Rebuilding
+    # vectors cannot restore source text removed by old parsers/chunkers.
+    async with async_session() as db:
+        source = await db.stream_scalars(
+            select(ChunkDB.text).join(DocumentDB, ChunkDB.document_id == DocumentDB.id).where(
+                DocumentDB.collection_id == collection_id,
+                DocumentDB.status == "completed",
+                ChunkDB.version_id == DocumentDB.current_version_id,
+            )
+        )
+        pending = []
+        async for text in source:
+            pending.append(text)
+            if len(pending) >= BATCH_SIZE:
+                await embedding.validate_texts(pending)
+                pending = []
+        if pending:
+            await embedding.validate_texts(pending)
 
     # 1. 删除旧集合（如果存在）
     exists = await qdrant.collection_exists(collection_id)
     if exists:
-        print(f"  删除旧集合...")
+        print("  删除旧集合...")
         await qdrant.delete_collection(collection_id)
 
     # 2. 创建新集合
-    print(f"  创建新集合...")
+    print("  创建新集合...")
     await qdrant.create_collection(
         collection_id=collection_id,
         vector_size=vector_dim,
@@ -61,7 +81,7 @@ async def rebuild_collection(collection_id: str, collection_name: str, vector_di
         documents = result.scalars().all()
 
     if not documents:
-        print(f"  ⚠️  没有已完成的文档，跳过")
+        print("  ⚠️  没有已完成的文档，跳过")
         return
 
     print(f"  找到 {len(documents)} 个已完成的文档")
@@ -109,7 +129,7 @@ async def rebuild_collection(collection_id: str, collection_name: str, vector_di
                             "file_type": doc.file_type,
                             "chunk_index": chunk.chunk_index,
                             "text": chunk.text,
-                            "page_num": chunk.page_num if chunk.page_num else -1,
+                            "page_num": chunk.page_num if chunk.page_num is not None else -1,
                             "token_count": chunk.token_count,
                         },
                     }
@@ -137,9 +157,7 @@ async def main():
                 print(f"❌ 找不到知识库: {target_collection_id}")
                 return
         else:
-            result = await db.execute(
-                select(CollectionDB).where(CollectionDB.is_active == True)
-            )
+            result = await db.execute(select(CollectionDB).where(CollectionDB.is_active == True))
             collections = result.scalars().all()
 
     if not collections:
@@ -173,9 +191,9 @@ async def main():
 
         await rebuild_collection(coll.id, coll.name, vector_dim)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("🎉 所有知识库向量索引重建完成!")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":

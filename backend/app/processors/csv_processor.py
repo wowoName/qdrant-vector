@@ -48,6 +48,9 @@ class CSVProcessor(BaseDocumentProcessor):
     # ------------------------------------------------------------------
     async def chunk(self, file_path: str) -> list[ChunkItem]:
         """全量切片"""
+        if self._get_chunk_config().get("mode") == "record":
+            from .excel_processor import ExcelProcessor
+            return await ExcelProcessor("csv").chunk(file_path)
         chunker = self._get_chunker()
         parse_result = await self.parse(file_path)
 
@@ -67,6 +70,11 @@ class CSVProcessor(BaseDocumentProcessor):
 
     async def chunk_stream(self, file_path: str) -> AsyncGenerator[ChunkItem, None]:
         """流式切片"""
+        if self._get_chunk_config().get("mode") == "record":
+            from .excel_processor import ExcelProcessor
+            async for chunk in ExcelProcessor("csv").chunk_stream(file_path):
+                yield chunk
+            return
         chunker = self._get_chunker()
         parse_result = await self.parse(file_path)
 

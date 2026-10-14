@@ -19,6 +19,7 @@ class ChunkItem:
     # 父子块相关（可选）
     parent_index: int = None  # type: ignore
     parent_text: str = None  # type: ignore
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

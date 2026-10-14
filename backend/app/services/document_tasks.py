@@ -22,7 +22,7 @@ import asyncio
 import os
 import time
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chunkers.factory import TABULAR_FILE_TYPES, get_chunker, get_chunker_for_file
@@ -203,6 +203,9 @@ async def _import_records_for_document(
     version_id: str,
     collection_id: str,
     file_type: str,
+    task_id: str | None = None,
+    task_svc: TaskService | None = None,
+    import_progress: float = 0.2,
 ) -> int:
     """
     将 Excel 数据导入为结构化记录（document_records 表）。
@@ -217,11 +220,24 @@ async def _import_records_for_document(
         )
 
         record_svc = DocumentRecordService(db=db, collection_id=collection_id)
+        async def report_import(processed: int):
+            if task_svc is None or task_id is None:
+                return
+            await task_svc.check_cancelled(task_id)
+            # Never commit the data transaction merely to display progress.
+            factory = getattr(task_svc, "_session_factory", None)
+            if factory:
+                async with factory() as progress_db:
+                    await TaskService(progress_db).update_progress(
+                        task_id, import_progress,
+                        {"stage": "importing_records", "processed_records": processed},
+                    )
         total = await record_svc.import_excel(
             file_path=file_path,
             document_id=document_id,
             version_id=version_id,
             batch_size=500,
+            on_progress=report_import,
         )
         logger.info(f"Record import complete: {total} records for doc {document_id}")
         return total
@@ -232,7 +248,7 @@ async def _import_records_for_document(
         raise
     except Exception as e:
         logger.error(f"Failed to import records: {e}", exc_info=True)
-        return 0
+        raise
 
 
 @register_task("document_process")
@@ -281,6 +297,16 @@ async def process_document_task(payload: dict, task_id: str, task_svc: TaskServi
             collection_id=collection_id,
             version=version,
         )
+
+        # A previous attempt may have committed some chunk batches before
+        # failing. Rebuild only this attempt's version, preserving other versions.
+        existing_chunk = await db.scalar(
+            select(ChunkDB.id).where(ChunkDB.version_id == version_id).limit(1)
+        )
+        if existing_chunk:
+            await qdrant.delete_by_version(collection_id, version_id)
+            await db.execute(delete(ChunkDB).where(ChunkDB.version_id == version_id))
+            await db.commit()
 
         # 4. 决定处理模式 —— 用 processor 统一获取文件信息
         file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
@@ -366,12 +392,6 @@ async def process_document_task(payload: dict, task_id: str, task_svc: TaskServi
                 f"Parsed document, text length: {text_len} ({size_class}), pages: {page_count}"
             )
 
-            if text_len == 0:
-                version.status = "completed"
-                version.chunk_count = 0
-                await db.commit()
-                return {"chunk_count": 0}
-
             use_chunk_streaming = text_len > _get_streaming_threshold()
 
             if use_chunk_streaming:
@@ -409,6 +429,8 @@ async def process_document_task(payload: dict, task_id: str, task_svc: TaskServi
                 )
 
         # 4. 后处理
+        if chunk_count == 0:
+            raise ValueError("未生成任何可索引切片，请检查解析结果、OCR 或文件格式，不能将空索引标记为完成")
         await _finalize_document(
             db=db,
             qdrant=qdrant,
@@ -432,6 +454,10 @@ async def process_document_task(payload: dict, task_id: str, task_svc: TaskServi
         }
 
     except asyncio.CancelledError:
+        if task_svc.is_worker_shutdown():
+            # Preserve committed batches; the recovered attempt cleans them up.
+            logger.info(f"Task {task_id} interrupted by worker shutdown; will resume on startup")
+            raise
         cancelled = True
         logger.warning(f"Task {task_id} was cancelled, cleaning up partial data...")
         # 任务被取消，清理已入库的部分数据
@@ -544,6 +570,8 @@ async def _process_standard(
             version_id=version.id,
             collection_id=collection_id,
             file_type=file_type,
+            task_id=task_id,
+            task_svc=task_svc,
         )
         t_rec = time.perf_counter() - t_rec_start
         logger.info(
@@ -589,8 +617,22 @@ async def _process_standard(
     embedding = await get_embedding()
     timer.record("embedding_setup")
 
+    chunk_items = await embedding.prepare_chunks(chunk_items)
+    for index, chunk in enumerate(chunk_items):
+        chunk.index = index
     texts = [c.text for c in chunk_items]
-    vectors = await embedding.embed_texts(texts)
+    vectors = []
+    batch_size = max(1, settings.embedding_batch_size)
+    for offset in range(0, len(texts), batch_size):
+        await task_svc.check_cancelled(task_id)
+        batch_vectors = await embedding.embed_texts(texts[offset:offset + batch_size])
+        if len(batch_vectors) != len(texts[offset:offset + batch_size]):
+            raise RuntimeError("Embedding result count does not match input count")
+        vectors.extend(batch_vectors)
+        await task_svc.update_progress(
+            task_id, 0.3 + 0.38 * len(vectors) / len(texts),
+            {"stage": "embedding", "processed": len(vectors), "total": len(texts)},
+        )
 
     timer.record("embedding")
     logger.info(f"Embedding complete: {len(vectors)} vectors")
@@ -778,6 +820,9 @@ async def _process_chunk_streaming(
             version_id=version.id,
             collection_id=collection_id,
             file_type=file_type,
+            task_id=task_id,
+            task_svc=task_svc,
+            import_progress=0.15,
         )
         t_rec = time.perf_counter() - t_rec_start
         logger.info(
@@ -813,7 +858,7 @@ async def _process_chunk_streaming(
             for c in chunk_iter:
                 yield c
 
-    async for chunk_item in _iter_chunks():
+    async for chunk_item in _embedding_safe_stream(_iter_chunks(), embedding):
         batch_chunks.append(chunk_item)
 
         if len(batch_chunks) >= mem_guard.current_batch_size:
@@ -1032,6 +1077,9 @@ async def _process_page_streaming(
                 version_id=version.id,
                 collection_id=collection_id,
                 file_type=file_type,
+                task_id=task_id,
+                task_svc=task_svc,
+                import_progress=0.1,
             )
             t_rec = time.perf_counter() - t_rec_start
             logger.info(
@@ -1053,7 +1101,7 @@ async def _process_page_streaming(
             )
         # ==========================================
 
-        async for chunk_item in processor.chunk_stream(file_path):
+        async for chunk_item in _embedding_safe_stream(processor.chunk_stream(file_path), embedding):
             await task_svc.check_cancelled(task_id)
             # 全局 index
             chunk_item.index = global_chunk_index
@@ -1202,7 +1250,7 @@ async def _process_page_streaming(
             logger.info(f"Document metadata: {page.metadata}")
 
         # 对这一页分块（流式）
-        for chunk_item in chunker.chunk_stream(page_text):
+        async for chunk_item in _embedding_safe_stream(chunker.chunk_stream(page_text), embedding):
             # 补上页码和全局 index
             chunk_item.page_num = page.page_num
             # 注意：页级流式的 char_start/end 是页内偏移，不是全局的
@@ -1285,6 +1333,40 @@ async def _process_page_streaming(
 # ------------------------------------------------------------------
 # 单批处理（被 chunk 流式和页级流式共用）
 # ------------------------------------------------------------------
+async def _embedding_safe_stream(source, embedding):
+    """Bounded preparation before batching, shared by all streaming modes."""
+    pending = []
+    index = 0
+
+    async def items():
+        if hasattr(source, "__aiter__"):
+            async for item in source:
+                yield item
+        else:
+            for item in source:
+                yield item
+
+    iterator = items()
+    try:
+        async for item in iterator:
+            pending.append(item)
+            if len(pending) >= 32:
+                for chunk in await embedding.prepare_chunks(pending):
+                    chunk.index = index
+                    index += 1
+                    yield chunk
+                pending = []
+        if pending:
+            for chunk in await embedding.prepare_chunks(pending):
+                chunk.index = index
+                index += 1
+                yield chunk
+    finally:
+        await iterator.aclose()
+        if hasattr(source, "aclose"):
+            await source.aclose()
+
+
 async def _process_one_batch(
     db: AsyncSession,
     qdrant,
@@ -1324,6 +1406,8 @@ async def _process_one_batch(
     texts = [c.text for c in batch_chunks]
     avg_text_len = sum(len(t) for t in texts) / len(texts) if texts else 0
     vectors = await embedding.embed_texts(texts)
+    if len(vectors) != len(batch_chunks):
+        raise RuntimeError("Embedding result count does not match input count")
     t_emb = time.perf_counter() - t_emb_start
 
     # 2. 写 DB
@@ -1423,6 +1507,10 @@ def _build_qdrant_points(
             "parent_text": chunk.parent_text or "",
             "parent_index": chunk.parent_index if chunk.parent_index is not None else -1,
         }
+        for key in ("sheet_name", "row_number", "record_part", "record_parts", "source_chunk_index",
+                    "token_split_part", "token_split_parts", "embedding_char_start", "embedding_char_end"):
+            if key in getattr(chunk, "metadata", {}):
+                payload[key] = chunk.metadata[key]
         points.append(
             {
                 "id": chunk_id,
@@ -1447,6 +1535,7 @@ async def _finalize_document(
     await task_svc.check_cancelled(task_id)
 
     version.status = "completed"
+    version.error_message = None
     version.chunk_count = chunk_count
 
     await db.flush()

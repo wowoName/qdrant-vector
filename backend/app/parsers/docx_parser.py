@@ -40,41 +40,45 @@ class DOCXParser(BaseParser):
         pages = []  # 按标题分段
         current_section = []
 
-        for para in doc.paragraphs:
+        from docx.oxml.text.paragraph import CT_P
+        from docx.oxml.table import CT_Tbl
+        from docx.text.paragraph import Paragraph
+        from docx.table import Table
+        tables = []
+        # Preserve body order: table values belong to their surrounding section.
+        for element in doc.element.body.iterchildren():
+            if isinstance(element, CT_Tbl):
+                table = Table(element, doc)
+                rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+                tables.append(rows)
+                if rows:
+                    headers = [value or f"列{i + 1}" for i, value in enumerate(rows[0])]
+                    lines = ["【表格】", "表头: " + " | ".join(headers)]
+                    for row in rows[1:]:
+                        lines.append("; ".join(f"{header}: {value}" for header, value in zip(headers, row) if value))
+                    paragraphs.extend(lines)
+                    current_section.extend(lines)
+                continue
+            if not isinstance(element, CT_P):
+                continue
+            para = Paragraph(element, doc)
             text = para.text.strip()
             if not text:
-                if current_section:
-                    paragraphs.append("")
+                paragraphs.append("")
+                current_section.append("")
                 continue
-
-            # 检测标题层级
             style = para.style.name if para.style else ""
             if style.startswith("Heading"):
-                # 保存上一个 section
                 if current_section:
                     pages.append("\n".join(current_section))
                     current_section = []
-                # 添加标题标记
                 level = style.replace("Heading", "").strip()
                 prefix = "#" * min(int(level) if level.isdigit() else 1, 6)
-                paragraphs.append(f"{prefix} {text}")
-                current_section.append(f"{prefix} {text}")
-            else:
-                paragraphs.append(text)
-                current_section.append(text)
-
-        # 最后一个 section
+                text = f"{prefix} {text}"
+            paragraphs.append(text)
+            current_section.append(text)
         if current_section:
             pages.append("\n".join(current_section))
-
-        # 提取表格
-        tables = []
-        for table in doc.tables:
-            table_data = []
-            for row in table.rows:
-                row_data = [cell.text.strip() for cell in row.cells]
-                table_data.append(row_data)
-            tables.append(table_data)
 
         full_text = "\n".join(paragraphs)
         full_text = normalize_text(full_text)

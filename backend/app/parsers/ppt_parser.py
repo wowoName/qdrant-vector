@@ -51,6 +51,7 @@ class PPTParser(BaseParser):
 
             # 提取标题
             title = ""
+            title_shape = None
             if slide.shapes.title:
                 title_shape = slide.shapes.title
                 if shape_has_text_frame(title_shape) and title_shape.text_frame:
@@ -67,7 +68,7 @@ class PPTParser(BaseParser):
                 if shape.has_text_frame:
                     text_frame = shape.text_frame
                     text = text_frame.text.strip()
-                    if text and shape != title:
+                    if text and shape != title_shape:
                         # 按段落添加
                         paragraphs_text = []
                         for para in text_frame.paragraphs:
@@ -109,9 +110,9 @@ class PPTParser(BaseParser):
                     slide_parts.append("")
                     slide_parts.append(f"【备注】\n{notes_text}")
 
-            if len(slide_parts) > 1:
-                slide_text = "\n".join(slide_parts)
-                pages.append(slide_text)
+            # Keep one page slot per slide, including title-only slides.
+            slide_text = "\n".join(slide_parts)
+            pages.append(slide_text)
 
         full_text = "\n\n".join(pages)
         full_text = normalize_text(full_text)

@@ -339,7 +339,7 @@ def apply_delta(
 
     filters = [item for item in (state.get("filters") or []) if isinstance(item, dict)]
 
-    if delta.reset_all:
+    if delta.reset_all or delta.operation == "new_query":
         filters = []
 
         for key in (
@@ -474,6 +474,9 @@ class QueryStateResolver:
         if rule_delta.reset_all or rule_delta.remove_columns:
             return rule_delta
 
+        if extract_profile_subject(query):
+            return StateDelta(operation="new_query", reset_all=True)
+
         if not getattr(
             settings,
             "chat_state_resolver_enabled",
@@ -604,6 +607,17 @@ customer / region / product / date / salesperson
             return detect_reset(query)
 
         return StateDelta(operation=operation)
+
+
+def extract_profile_subject(query: str) -> str | None:
+    """Recognize a standalone named-person profile request, including terse word order."""
+    text = re.sub(r"\s+", "", query or "").strip("，,。！？?!")
+    text = re.sub(r"^(?:请|帮我|给我|给出|查询|查一下|查看|提供)+", "", text)
+    text = re.sub(r"(?:请给出|给出|给我|提供|查一下)$", "", text)
+    match = re.fullmatch(r"([\u4e00-\u9fff]{2,4}?)(?:的)?(?:个人|基本|详细|全部)?(?:信息|资料|档案)", text)
+    if not match or match[1] in {"他的", "她的", "他们", "她们", "这个人", "这些人", "员工", "人员", "客户", "产品", "订单", "销售", "个人", "基本", "详细", "全部", "相关"}:
+        return None
+    return match[1]
 
 
 def _loads_json(text: str | None) -> dict | None:

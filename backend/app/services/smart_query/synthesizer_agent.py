@@ -16,12 +16,31 @@ SynthesizerAgent - 结果融合代理
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Callable
 from typing import Optional
 
 from app.core.logging import get_logger
 from app.providers.llm.base import ChatMessage
 from app.providers.llm.factory import create_llm
+from app.services.query_state import extract_profile_subject
+from .constants import (
+    DEFAULT_MAX_CHUNKS,
+    DEFAULT_MAX_ROWS,
+    ENTITY_VALUE_MAX_LEN,
+    ENTITY_VALUE_MIN_LEN,
+    MAX_CROSS_TABLE_DIFF_ITEMS,
+    NON_ENTITY_VALUES,
+    RETRIEVAL_MAX_CHUNKS,
+    SQL_HYBRID_MAX_ROWS,
+    SQL_SUMMARY_MAX_ROWS,
+    get_entity_value_date_re,
+    get_entity_value_num_re,
+    get_llm_config,
+    get_non_entity_col_re,
+)
+from .prompts import get_prompt
 from .types import (
     FilterInfo,
     MultiRetrievalResult,
@@ -37,20 +56,8 @@ from .types import (
 logger = get_logger(__name__)
 
 
-SYNTHESIS_SYSTEM_PROMPT = """你是一个专业的数据回答助手。请根据提供的查询结果，生成准确、清晰、有条理的回答。
-
-重要规则：
-1. 只使用提供的数据回答问题，不要编造或推断数据之外的信息
-2. 如果提供了 SQL 查询结果，优先使用 SQL 的精确数据（SQL 是完整的精确查询，不是模糊检索）
-3. 如果提供了向量检索结果，可以用它来补充说明或上下文（向量检索是近似匹配，可能不完整）
-4. 回答时请条理清晰，重点突出
-5. 对于统计数字类问题，如果同时提供了总数和明细列表，请先给出明确的数字答案，再列出明细
-6. 对于列表类问题，使用有序或无序列表呈现；如果有总数和展示数的差异，要说明"共 X 条，展示前 Y 条"
-7. 不要提"根据SQL查询结果"或"根据向量检索"这类技术性表述
-8. 如果数据不足或查询失败，明确说明"根据现有资料无法回答该问题"
-9. 当用户问"有多少个/多少名"时，默认同时给出总数和明细列表，明细是重要的参考信息
-
-请用自然语言组织答案，让用户容易理解。"""
+# 结果合成的系统提示（从 prompts/ 目录加载，支持运行时热更新）
+SYNTHESIS_SYSTEM_PROMPT = get_prompt("synthesis_system")
 
 
 class SynthesizerAgent:
@@ -101,12 +108,26 @@ class SynthesizerAgent:
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        scene: str = "synthesis",
     ) -> str:
         """调用 LLM 生成文本。
 
         - 未绑定 delta_sink：与 BaseLLM.simple_chat 行为完全一致（非流式）
         - 已绑定 delta_sink：走 chat_stream，逐段回调，最后返回拼接结果
+
+        Args:
+            scene: LLM 场景名，用于从配置中获取默认 temperature/max_tokens
+                   调用方传入的 temperature/max_tokens 优先级更高
         """
+        from app.core.config import settings
+
+        # 场景默认参数（调用方显式传入的优先）
+        llm_cfg = get_llm_config(scene, settings)
+        if temperature is None:
+            temperature = llm_cfg["temperature"]
+        if max_tokens is None:
+            max_tokens = llm_cfg["max_tokens"]
+
         llm = self._get_llm()
         if llm is None:
             raise RuntimeError("LLM 不可用")
@@ -159,14 +180,15 @@ class SynthesizerAgent:
         return retry or text
 
     def _get_llm(self):
-        """获取 LLM 实例（懒加载）"""
+        """获取 LLM 实例（懒加载，使用 synthesis 场景配置）"""
         if self._llm is None:
             try:
                 from app.core.config import settings
 
+                llm_cfg = get_llm_config("synthesis", settings)
                 self._llm = create_llm(
-                    provider=settings.llm_provider,
-                    model=settings.chat_llm_model or None,
+                    provider=llm_cfg["provider"],
+                    model=llm_cfg["model"],
                 )
             except Exception as e:
                 logger.warning(f"Failed to create LLM for SynthesizerAgent: {e}")
@@ -222,8 +244,13 @@ class SynthesizerAgent:
             "5. 如果某个子问题没有找到数据，明确说明「未找到相关数据」，并简单解释可能的原因\n"
             "6. 回答结构清晰：先给出核心结论，再展开细节，最后说明数据来源\n"
             "7. 如果同一个信息在多个来源中都有，优先使用最匹配的数据源\n"
-            "8. **重要：列表类数据（如人员名单、部门列表、客户名称等）必须全量列出，不要只展示前几个，不要用「等」字省略**\n"
-            "9. 如果数据量很大（超过50条），可以分组展示，但必须确保每条数据都呈现给用户\n\n"
+            "8. 列表类数据（如人员名单、客户名称等较短清单）应尽量完整列出，不要用「等」字省略\n"
+            "9. **明细类记录（如销售记录表）最多展示 20 条**，不要逐条罗列超过 20 条；"
+            "若总数超过展示数，请说明「完整明细可在回答末尾下载」，由系统自动附上下载链接\n"
+            '10. 如果【表间字段语义差异】部分有内容，必须在回答末尾专门用一段说明'
+            '（标题为「数据说明」），讲清楚：同一个实体在不同表里是用什么字段表达的、'
+            '可能存在的不一致（例如同一个名字在销售表是"销售经理"角色、在员工表职位却是"物流专员"），'
+            '帮助用户理解为什么查询结果会来自不同的表、以及它们含义的区别。\n\n'
             f"【检索结果】\n{context_text}"
         )
 
@@ -231,8 +258,7 @@ class SynthesizerAgent:
             answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=system_prompt,
-                temperature=0.3,
-                max_tokens=1500,
+                scene="synthesis_multi",
             )
             answer = answer.strip()
         except Exception as e:
@@ -295,14 +321,39 @@ class SynthesizerAgent:
                         lines.append(f"      （其余 {total_distinct - show_n} 个见回答末尾的下载文件）")
 
                 if detail_hits:
-                    # 普通明细：增加到 20 条
-                    show_count = min(20, len(detail_hits))
-                    lines.append(f"    相关记录（共{len(detail_hits)}条，展示前{show_count}条）：")
-                    for j, hit in enumerate(detail_hits[:show_count]):
-                        content = hit.content[:150] if hasattr(hit, "content") and hit.content else str(hit.payload.get("row_data", ""))[:150]
-                        lines.append(f"      {j+1}. {content}")
-                    if len(detail_hits) > show_count:
-                        lines.append(f"      ... 还有 {len(detail_hits) - show_count} 条")
+                    # 明细记录：按表分组展示，LLM 更容易理解数据结构
+                    from collections import defaultdict
+                    by_table = defaultdict(list)
+                    for h in detail_hits:
+                        src = h.payload.get("source_file", "未知来源")
+                        by_table[src].append(h)
+
+                    lines.append(f"    明细记录（共{len(detail_hits)}条，来自 {len(by_table)} 个表）：")
+
+                    # 按记录数从少到多排序（小表优先，通常更接近核心信息）
+                    sorted_tables = sorted(by_table.items(), key=lambda x: len(x[1]))
+                    shown = 0
+                    max_show = 20  # 总共展示上限
+
+                    for table_name, table_hits in sorted_tables:
+                        shown_in_table = min(len(table_hits), max_show - shown)
+                        if shown_in_table <= 0:
+                            break
+                        count = len(table_hits)
+                        lines.append(f"      ▸ {table_name}（共{count}条）：")
+                        for j, hit in enumerate(table_hits[:shown_in_table]):
+                            content = (
+                                hit.content[:150]
+                                if hasattr(hit, "content") and hit.content
+                                else str(hit.payload.get("row_data", ""))[:150]
+                            )
+                            lines.append(f"        {j+1}. {content}")
+                            shown += 1
+                        if count > shown_in_table:
+                            lines.append(f"        ... 此表还有 {count - shown_in_table} 条")
+                    remaining = len(detail_hits) - shown
+                    if remaining > 0:
+                        lines.append(f"    ... 其余 {remaining} 条见下载文件")
 
             # 向量结果
             sub_vec = vec_by_sub.get(sub_q, [])
@@ -315,7 +366,172 @@ class SynthesizerAgent:
             if not sub_sql and not sub_vec:
                 lines.append("  （未找到相关结果）")
 
+        # ===== 表间字段语义差异检测 =====
+        # 思路：扫描所有 SQL 命中的行/列，找出"同一个实体值出现在不同表的不同列"的情况。
+        # 例如："王强" 在销售表是「销售经理」列，在员工表是「姓名」列；
+        # 这种差异如果不告知用户，用户会疑惑"为什么只给了金额没给部门"。
+        diff_text = self._detect_cross_table_diffs(sql_hits)
+        if diff_text:
+            lines.append("\n【表间字段语义差异】")
+            lines.append(diff_text)
+
         return "\n".join(lines)
+
+    def _detect_cross_table_diffs(self, sql_hits: list) -> str:
+        """
+        检测并描述跨表的字段语义差异（通用版，不依赖业务关键词）。
+
+        核心思路（不靠硬编码业务词，而是从数据特征 + 语义类型判断）：
+        - 只看明细行（非 aggregate / distinct_list）的字符串列值
+        - 同一个值（短字符串、像实体名）出现在 >= 2 张表，且对应的列名不同 → 记为一处差异
+        - 排除明显的分类值 / 非实体值：纯数字、日期时间、性别类（男/女）、布尔类（是/否/有/无/真/假）等
+        - 新增：基于列名推断语义类型，**只有同一语义类型的列之间出现值重叠才记为差异**，
+          避免"日期列与金额列有重叠数字"这类误报
+
+        配置集中在 constants.py（NON_ENTITY_VALUES / NON_ENTITY_COL_PATTERNS 等），
+        新增过滤规则只需改配置，不用动代码。
+        """
+        from collections import defaultdict
+
+        non_entity_col_re = get_non_entity_col_re()
+        num_re = get_entity_value_num_re()
+        date_re = get_entity_value_date_re()
+
+        # key: 归一化的值, value: list of (file_name, column_name, semantic_type)
+        value_locations: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+        seen_pairs: set[tuple[str, str, str]] = set()  # (value, file, col) 去重
+
+        for hit in sql_hits:
+            payload = getattr(hit, "payload", None) or {}
+            if payload.get("type") in ("aggregate", "distinct_list"):
+                continue
+            source_file = payload.get("source_file", "")
+            row_data = payload.get("row_data")
+            if row_data is None:
+                # 没有 row_data 的话，直接看 payload 里的普通字段
+                row_data = {
+                    k: v
+                    for k, v in payload.items()
+                    if k
+                    not in {
+                        "type",
+                        "operation",
+                        "sub_query",
+                        "source_file",
+                        "document_id",
+                        "source_table",
+                        "empty",
+                    }
+                    and isinstance(v, (str, int, float))
+                }
+            if not isinstance(row_data, dict):
+                continue
+            for col, val in row_data.items():
+                if val is None:
+                    continue
+                # 列名层面过滤：明显不是实体名所在列的，直接跳过
+                if non_entity_col_re.search(col):
+                    continue
+                sval = str(val).strip()
+                # 长度太短或太长的都不像实体名
+                if len(sval) < ENTITY_VALUE_MIN_LEN or len(sval) > ENTITY_VALUE_MAX_LEN:
+                    continue
+                # 纯数字 / 纯标点 跳过
+                if num_re.fullmatch(sval):
+                    continue
+                # 日期格式 跳过
+                if date_re.fullmatch(sval):
+                    continue
+                # 明显的分类值 / 布尔值 跳过
+                if sval in NON_ENTITY_VALUES or sval.lower() in NON_ENTITY_VALUES:
+                    continue
+
+                key = (sval, source_file, col)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+
+                # 基于列名快速推断语义类型（轻量版，仅用于跨表对齐）
+                sem_type = self._quick_semantic_type(col)
+                value_locations[sval].append((source_file, col, sem_type))
+
+        # 筛选出跨表且列名不同的值
+        diff_lines = []
+        for val, locs in value_locations.items():
+            files = {f for f, _, _ in locs}
+            cols = {c for _, c, _ in locs}
+            if len(files) < 2 or len(cols) < 2:
+                continue
+
+            # 语义类型对齐：只有同一类型（且非 OTHER）的列之间才算实体差异
+            # 逻辑：如果所有位置的类型都不是 OTHER，且类型不统一 → 不是同一实体，跳过
+            types = {t for _, _, t in locs if t != "other"}
+            if types and len(types) > 1:
+                # 多个不同语义类型，可能是误报（如"1月"同时出现在月份列和部门列），跳过
+                continue
+
+            # 推断主导语义类型（用于描述）
+            dominant_type = next(iter(types)) if types else "other"
+            type_label = {
+                "person": "人物",
+                "organization": "机构",
+                "location": "地点",
+                "time": "时间",
+                "amount": "金额",
+                "quantity": "数量",
+                "id": "编号",
+                "category": "分类",
+                "other": "实体",
+            }.get(dominant_type, "实体")
+
+            # 把每个表对应的列名整理出来
+            by_file: dict[str, set[str]] = defaultdict(set)
+            for f, c, _ in locs:
+                by_file[f].add(c)
+            desc = "、".join(
+                f"「{f}」表的{('、'.join(sorted(cs)))}列" for f, cs in by_file.items()
+            )
+            diff_lines.append(
+                f"  • 「{val}」（{type_label}类）同时出现在 {desc}"
+                f"（同一{type_label}在不同表中用不同字段表达）"
+            )
+
+        if not diff_lines:
+            return ""
+        return "\n".join(diff_lines[:MAX_CROSS_TABLE_DIFF_ITEMS])
+
+    @staticmethod
+    def _quick_semantic_type(col_name: str) -> str:
+        """
+        基于列名快速推断语义类型（轻量版，仅供差异检测内部使用）。
+
+        完整版本在 SchemaProvider._infer_semantic_type（还结合数据类型和样本值）。
+        """
+        name_lower = col_name.lower()
+
+        # 按优先级匹配
+        rules = [
+            ("time", ["日期", "时间", "月份", "年份", "季度", "周", "date", "time", "month", "year", "quarter"]),
+            ("amount", ["金额", "销售额", "利润", "费用", "收入", "成本", "价格", "单价", "总额", "合计",
+                        "amount", "price", "cost", "revenue", "profit", "sales", "total", "fee"]),
+            ("quantity", ["数量", "个数", "件数", "重量", "百分比", "比例", "quantity", "count", "qty", "num"]),
+            ("person", ["姓名", "员工", "业务员", "销售员", "联系人", "人员", "经理", "总监", "主任", "主管",
+                        "负责人", "name", "person", "employee", "staff", "contact", "manager", "director"]),
+            ("organization", ["公司", "客户", "供应商", "部门", "单位", "机构", "企业", "厂商", "品牌",
+                              "company", "organization", "department", "dept", "customer", "vendor", "supplier"]),
+            ("location", ["城市", "地区", "地址", "省份", "国家", "区域", "地点",
+                          "city", "province", "address", "region", "area", "location"]),
+            ("id", ["编号", "ID", "工号", "单号", "编码", "序号", "id", "code", "sn"]),
+            ("category", ["类型", "状态", "等级", "级别", "类别", "分类", "性别", "种类",
+                          "type", "status", "level", "category", "class", "gender"]),
+        ]
+
+        for sem_type, keywords in rules:
+            for kw in keywords:
+                if kw.lower() in name_lower:
+                    return sem_type
+        return "other"
+
 
     def _fallback_subquery_answer(
         self, query: str, sub_queries: list[str], sql_hits: list, vector_hits: list
@@ -355,21 +571,47 @@ class SynthesizerAgent:
                     content = hit.content.strip() if hit.content else str(hit.payload.get("value", ""))
                     parts.append(f"  {j}. {content}")
             elif detail_hits:
-                # 明细类：展示前 20 条关键信息
-                parts.append(f"【{sub_q}】找到 {len(detail_hits)} 条相关记录：")
-                for j, hit in enumerate(detail_hits[:20]):
-                    row_data = hit.payload.get("row_data", {}) or {}
-                    # 展示几个关键字段
-                    key_fields = []
-                    for k, v in row_data.items():
-                        if v and k not in ("type", "operation", "source_table", "sub_query", "document_id", "total_count", "source_file"):
-                            key_fields.append(f"{k}: {v}")
-                            if len(key_fields) >= 4:
-                                break
-                    if key_fields:
-                        parts.append(f"  {j+1}. " + "，".join(key_fields))
-                if len(detail_hits) > 20:
-                    parts.append(f"  ... 还有 {len(detail_hits) - 20} 条")
+                # 明细类：按表分组展示（多表场景下更清晰）
+                # - 小表（<=5 条）：完整展示每行内容
+                # - 大表（>5 条）：只给概览（条数 + 前2条样例）
+                from collections import defaultdict
+                by_table = defaultdict(list)
+                for h in detail_hits:
+                    src = h.payload.get("source_file", "未知来源")
+                    by_table[src].append(h)
+
+                parts.append(f"【{sub_q}】共 {len(detail_hits)} 条记录（来自 {len(by_table)} 个表）：")
+
+                # 按记录数从少到多排序（小表优先，通常更接近"详情"需求）
+                sorted_tables = sorted(by_table.items(), key=lambda x: len(x[1]))
+
+                for table_name, table_hits in sorted_tables:
+                    count = len(table_hits)
+                    parts.append(f"  ▸ {table_name}（{count} 条）：")
+
+                    if count <= 5:
+                        # 小表：完整展示
+                        for j, hit in enumerate(table_hits, 1):
+                            row_data = self._detail_row_data(hit)
+                            key_fields = []
+                            for k, v in row_data.items():
+                                if v is not None and v != "":
+                                    key_fields.append(f"{k}={v}")
+                            if key_fields:
+                                parts.append(f"    {j}. " + "，".join(key_fields))
+                    else:
+                        # 大表：展示前 2 条样例 + 省略
+                        for j, hit in enumerate(table_hits[:2], 1):
+                            row_data = self._detail_row_data(hit)
+                            key_fields = []
+                            for k, v in row_data.items():
+                                if v is not None and v != "":
+                                    key_fields.append(f"{k}={v}")
+                                    if len(key_fields) >= 5:
+                                        break
+                            if key_fields:
+                                parts.append(f"    {j}. " + "，".join(key_fields))
+                        parts.append(f"    ... 还有 {count - 2} 条（完整明细见附件）")
             else:
                 # 没有找到该子查询的结果
                 parts.append(f"【{sub_q}】未找到相关数据")
@@ -377,6 +619,17 @@ class SynthesizerAgent:
         if parts:
             return "根据检索结果：\n" + "\n".join(f"• {p}" if not p.startswith("  ") else p for p in parts)
         return "未找到相关信息。"
+
+    def _detail_row_data(self, hit) -> dict:
+        """SQL hits use flat payloads; also accept older nested row_data payloads."""
+        payload = hit.payload or {}
+        row = payload.get("row_data")
+        if not isinstance(row, dict) or not row:
+            row = payload
+        internal_keys = self._INTERNAL_PAYLOAD_KEYS | {
+            "from_count_query", "from_aggregate_query", "_total_groups", "_shown_groups",
+        }
+        return {key: value for key, value in row.items() if key not in internal_keys}
 
     # ------------------------------------------------------------------
     # 明细导出下载链接
@@ -618,6 +871,11 @@ class SynthesizerAgent:
 
         # 属性定向问答：用户问的是"某实体的某属性"（如"胡兰桂在哪个部门"），
         # 直接回答该属性值，避免把整行明细 dump 成表格
+        if has_sql and extract_profile_subject(query):
+            hits = [hit for hit in multi_result.sql_hits if not hit.payload.get("empty")]
+            answer = self._build_retrieval_text(self._hits_to_retrieval_result(hits), self.DETAIL_INLINE_LIMIT)
+            return self._append_detail_download_link(answer, hits), self._build_references_multi(multi_result, context)
+
         if has_sql and plan.projection_column:
             projection_answer = self._answer_projection(plan, multi_result.sql_hits)
             if projection_answer:
@@ -748,8 +1006,7 @@ class SynthesizerAgent:
                     answer = await self._llm_text(
                         prompt=f"用户问题：{query}",
                         system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context_text,
-                        temperature=0.3,
-                        max_tokens=2048,
+                        scene="synthesis_multi_sql",
                     )
                     return answer.strip()
                 except Exception as e:
@@ -820,8 +1077,7 @@ class SynthesizerAgent:
             answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context_text,
-                temperature=0.5,
-                max_tokens=2048,
+                scene="synthesis_multi_hybrid",
             )
             return answer.strip()
 
@@ -1099,7 +1355,8 @@ class SynthesizerAgent:
                     references.append({
                         "chunk_id": hit.record_id or f"sql_detail_{i}",
                         "document_id": hit.document_id or doc_id,
-                        "document_name": doc_name or hit.sheet_name,
+                        "document_name": hit.metadata.get("table_name") or hit.payload.get("source_file") or doc_name or hit.sheet_name,
+                        "collection_id": hit.metadata.get("collection_id", ""),
                         "chunk_index": hit.row_number,
                         "text": hit.content,
                         "score": hit.score,
@@ -1112,7 +1369,8 @@ class SynthesizerAgent:
                     references.append({
                         "chunk_id": hit.record_id or f"sql_{i}",
                         "document_id": hit.document_id or doc_id,
-                        "document_name": doc_name or hit.sheet_name,
+                        "document_name": hit.metadata.get("table_name") or hit.payload.get("source_file") or doc_name or hit.sheet_name,
+                        "collection_id": hit.metadata.get("collection_id", ""),
                         "chunk_index": hit.row_number,
                         "text": hit.content,
                         "score": hit.score,
@@ -1218,6 +1476,8 @@ class SynthesizerAgent:
             results.append({
                 "chunk_id": hit.record_id,
                 "document_id": hit.document_id,
+                "document_name": hit.payload.get("document_name") or hit.payload.get("source_file") or hit.metadata.get("table_name") or "未知文档",
+                "collection_id": hit.payload.get("collection_id") or hit.metadata.get("collection_id", ""),
                 "text": hit.content,
                 "score": hit.score,
                 "page_num": hit.metadata.get("page_num", 0),
@@ -1347,7 +1607,7 @@ class SynthesizerAgent:
             return simple_answer
 
         try:
-            result_table = sql_result.to_markdown_table(max_rows=20)
+            result_table = sql_result.to_markdown_table(max_rows=SQL_SUMMARY_MAX_ROWS)
             # 使用真实总数（total_count 如果有的话），否则用 row_count
             total = getattr(sql_result, "total_count", None)
             total_display = total if total is not None else sql_result.row_count
@@ -1360,8 +1620,7 @@ class SynthesizerAgent:
             answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context,
-                temperature=0.3,
-                max_tokens=1200,
+                scene="synthesis_sql",
             )
 
             return answer.strip()
@@ -1510,8 +1769,7 @@ class SynthesizerAgent:
             answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n参考资料：\n" + context,
-                temperature=0.7,
-                max_tokens=2048,
+                scene="synthesis_semantic",
             )
 
             return answer.strip()
@@ -1520,7 +1778,7 @@ class SynthesizerAgent:
             logger.warning(f"LLM semantic synthesis failed: {e}")
             return self._build_retrieval_text(retrieval_result)
 
-    def _build_retrieval_context(self, result: RetrievalQueryResult, max_chunks: int = 5) -> str:
+    def _build_retrieval_context(self, result: RetrievalQueryResult, max_chunks: int = DEFAULT_MAX_CHUNKS) -> str:
         """构造检索上下文"""
         if not result.success or not result.results:
             return "（无相关参考资料）"
@@ -1533,16 +1791,17 @@ class SynthesizerAgent:
 
         return "\n\n".join(parts)
 
-    def _build_retrieval_text(self, result: RetrievalQueryResult) -> str:
+    def _build_retrieval_text(self, result: RetrievalQueryResult, max_results: int = 5) -> str:
         """直接生成检索结果文本（无 LLM 时）"""
         if not result.success or not result.results:
             return "未找到相关结果。"
 
         parts = ["找到以下相关内容：\n"]
-        for i, r in enumerate(result.results[:5], 1):
+        for i, r in enumerate(result.results[:max_results], 1):
             doc_name = r.get("document_name", "未知文档")
-            text = r.get("text", "")[:200]
-            parts.append(f"**{i}. {doc_name}**\n{text}...\n")
+            text = r.get("text", "")
+            preview = text[:1000] + ("…" if len(text) > 1000 else "")
+            parts.append(f"**{i}. {doc_name}**\n{preview}\n")
 
         return "\n".join(parts)
 
@@ -1565,8 +1824,8 @@ class SynthesizerAgent:
             return sql_answer
 
         try:
-            sql_table = sql_result.to_markdown_table(max_rows=15)
-            retrieval_context = self._build_retrieval_context(retrieval_result, max_chunks=3)
+            sql_table = sql_result.to_markdown_table(max_rows=SQL_HYBRID_MAX_ROWS)
+            retrieval_context = self._build_retrieval_context(retrieval_result, max_chunks=RETRIEVAL_MAX_CHUNKS)
 
             context = f"""精确查询结果（来自数据表）：
 {sql_table}
@@ -1577,8 +1836,7 @@ class SynthesizerAgent:
             answer = await self._llm_text(
                 prompt=f"用户问题：{query}",
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT + "\n\n" + context,
-                temperature=0.5,
-                max_tokens=2048,
+                scene="synthesis_hybrid",
             )
 
             return answer.strip()

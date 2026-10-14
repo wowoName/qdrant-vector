@@ -52,7 +52,7 @@ class PDFProcessor(BaseDocumentProcessor):
         chunker = self._get_chunker()
         parse_result = await self.parse(file_path)
 
-        if parse_result.pages and len(parse_result.pages) > 1:
+        if parse_result.pages:
             return chunker.chunk_with_pages(parse_result.pages)
         return chunker.chunk(parse_result.text)
 
@@ -114,25 +114,7 @@ class PDFProcessor(BaseDocumentProcessor):
 
             cfg = self._get_chunk_config()
             strategy = cfg.get("strategy", settings.chunk_strategy)
-            chunker = get_chunker(strategy)
-
-            # 动态设置 size / overlap
-            if "size" in cfg and hasattr(chunker, "chunk_size"):
-                try:
-                    chunker.chunk_size = cfg["size"]
-                except Exception:
-                    pass
-            if "overlap" in cfg and hasattr(chunker, "chunk_overlap"):
-                try:
-                    chunker.chunk_overlap = cfg["overlap"]
-                except Exception:
-                    pass
-            if "min_size" in cfg and hasattr(chunker, "chunk_min_size"):
-                try:
-                    chunker.chunk_min_size = cfg["min_size"]
-                except Exception:
-                    pass
-
+            chunker = get_chunker(strategy, file_type=self._file_type)
             self._chunker = chunker
         return self._chunker
 

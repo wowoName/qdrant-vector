@@ -46,9 +46,9 @@ class SemanticChunker(BaseChunker):
         max_sentences_for_embedding: int = 2000,  # 超过此数量则采样
         sentence_group_size: int = 3,  # 每 N 句合并为一个语义单元再计算 embedding
     ):
-        self.chunk_size = chunk_size or settings.chunk_size
-        self.chunk_overlap = chunk_overlap or settings.chunk_overlap
-        self.min_size = min_size or settings.chunk_min_size
+        self.chunk_size = settings.chunk_size if chunk_size is None else chunk_size
+        self.chunk_overlap = settings.chunk_overlap if chunk_overlap is None else chunk_overlap
+        self.min_size = settings.chunk_min_size if min_size is None else min_size
         # 相似度阈值：低于此值认为是语义边界
         self.similarity_threshold = similarity_threshold or getattr(
             settings, "chunk_similarity_threshold", 0.65
@@ -283,7 +283,7 @@ class SemanticChunker(BaseChunker):
             # 检查加上这个句子是否超过 chunk_size
             if current_len + sent_len > self.chunk_size and current_sentences:
                 chunk_text = "".join(s["text"] for s in current_sentences).strip()
-                if chunk_text and len(chunk_text) >= self.min_size:
+                if chunk_text:
                     chunks.append(ChunkItem(
                         text=chunk_text,
                         index=0,
@@ -296,7 +296,7 @@ class SemanticChunker(BaseChunker):
             elif i in boundary_set and current_len >= self.min_size and current_sentences:
                 # 是语义边界且当前块足够大，切开
                 chunk_text = "".join(s["text"] for s in current_sentences).strip()
-                if chunk_text and len(chunk_text) >= self.min_size:
+                if chunk_text:
                     chunks.append(ChunkItem(
                         text=chunk_text,
                         index=0,
@@ -313,7 +313,7 @@ class SemanticChunker(BaseChunker):
         # 最后一个 chunk
         if current_sentences:
             chunk_text = "".join(s["text"] for s in current_sentences).strip()
-            if chunk_text and len(chunk_text) >= self.min_size:
+            if chunk_text:
                 chunks.append(ChunkItem(
                     text=chunk_text,
                     index=0,

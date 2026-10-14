@@ -31,6 +31,7 @@ _engine_kwargs["pool_pre_ping"] = True  # 连接前先 ping，确保连接有效
 
 # 会话时区：让 PostgreSQL 会话按应用时区（默认北京时间）解释 now()/current_timestamp
 _engine_kwargs["connect_args"] = {
+    "command_timeout": settings.db_command_timeout,
     "server_settings": {"timezone": settings.app_timezone}
 }
 

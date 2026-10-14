@@ -17,9 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import __version__
 from app.api.v1 import api_router
-from app.core.chat_database import init_chat_db
+from app.core.chat_database import chat_engine, init_chat_db
 from app.core.config import settings
-from app.core.database import async_session, init_db
+from app.core.database import async_session, engine, init_db
 from app.core.exceptions import AppException
 from app.core.logging import get_logger, setup_logging
 from app.core.middleware import RequestIDMiddleware
@@ -39,6 +39,16 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.app_name} v{__version__}...")
     logger.info(f"Environment: {settings.app_env}")
 
+    import asyncio
+
+    if sys.platform == "win32" and not isinstance(asyncio.get_running_loop(), asyncio.ProactorEventLoop):
+        raise RuntimeError(
+            "Windows 当前启动方式使用了 SelectorEventLoop，会导致 PostgreSQL 写入卡住。"
+            "请在 backend 目录执行：uv run python -m app.main，"
+            "或在项目根目录执行：powershell -ExecutionPolicy Bypass -File .\\backend\\start.ps1。"
+            "Windows 请勿添加 --reload 或启用多个 workers。"
+        )
+
     # 初始化主数据库
     await init_db()
     logger.info("Main database initialized.")
@@ -46,10 +56,6 @@ async def lifespan(app: FastAPI):
     # 初始化对话数据库
     await init_chat_db()
     logger.info("Chat database initialized.")
-
-    # 启动任务 Worker
-    await start_task_workers(async_session)
-    logger.info("Task workers started.")
 
     # 预加载 Embedding 模型（避免首次处理时的冷启动延迟）
     try:
@@ -67,7 +73,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Startup Qdrant sync failed: {e}")
 
-    logger.info(f"{settings.app_name} is ready!")
+    # 启动依赖就绪后再恢复文档任务，避免与模型预加载、数据同步竞争。
+    await start_task_workers(async_session)
+    logger.info("Task workers started.")
+    logger.info(f"{settings.app_name} is ready! Health check: /health")
 
     yield
 
@@ -75,6 +84,10 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down...")
     await stop_task_workers()
     logger.info("Task workers stopped.")
+    if chat_engine is not engine:
+        await chat_engine.dispose()
+    await engine.dispose()
+    logger.info("Database connection pools closed.")
     logger.info("Shutdown complete.")
 
 
@@ -187,8 +200,12 @@ def main():
         "app.main:app",
         host=settings.app_host,
         port=settings.app_port,
-        workers=settings.workers if not settings.app_debug else None,
-        reload=settings.app_debug,
+        # Windows reloader transfers an inherited listening socket that can
+        # fail registration with IOCP after reload (WinError 87). asyncpg still
+        # requires Proactor here, so use a single process without that socket.
+        workers=1 if sys.platform == "win32" else (settings.workers if not settings.app_debug else None),
+        reload=settings.app_debug and sys.platform != "win32",
+        loop="app.core.event_loop:create_event_loop",
         log_level=settings.log_level.lower(),
     )
 

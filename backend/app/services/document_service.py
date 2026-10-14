@@ -143,7 +143,7 @@ class DocumentService:
                 )
             )
             old_ver = old_ver_result.scalar_one_or_none()
-            if old_ver and old_ver.file_hash == file_hash:
+            if old_ver and old_ver.file_hash == file_hash and old_ver.status == "completed" and existing_doc.status == "completed":
                 # 文件未变化，直接返回
                 _cleanup_source()
                 return SimpleUploadResponse(
@@ -222,6 +222,7 @@ class DocumentService:
             payload={
                 "version_id": version.id,
                 "document_id": doc_id,
+                "file_name": filename,
                 "collection_id": collection_id,
                 "file_type": file_type,
             },
@@ -431,6 +432,7 @@ class DocumentService:
             payload={
                 "version_id": new_version.id,
                 "document_id": document_id,
+                "file_name": doc.name,
                 "collection_id": doc.collection_id,
                 "file_type": doc.file_type,
             },

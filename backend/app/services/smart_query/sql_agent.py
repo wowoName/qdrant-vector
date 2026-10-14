@@ -25,6 +25,8 @@ from typing import Optional
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.providers.llm.factory import create_llm
+from .constants import DEFAULT_MAX_RETRIES, get_llm_config
+from .prompts import get_prompt
 from .schema_provider import SchemaProvider
 from .types import QueryIntent, QueryOperation, QueryPlan, SQLQueryResult, TableSchema
 
@@ -41,26 +43,8 @@ FORBIDDEN_KEYWORDS = [
 # DuckDB 支持的安全操作
 ALLOWED_STATEMENTS = ["SELECT", "WITH", "EXPLAIN", "DESCRIBE"]
 
-# SQL 生成的系统提示
-SQL_GENERATION_SYSTEM_PROMPT = """你是一个专业的 DuckDB SQL 生成助手。
-请根据用户的问题和表结构，生成正确的 DuckDB SQL 查询语句。
-
-表结构信息：
-{schema_summary}
-
-重要规则：
-1. 只生成 SELECT 语句，不允许任何修改数据的操作
-2. 所有列名和表名必须用双引号包裹，例如："销售总监"、"业务员"
-3. 如果列名是中文，必须用双引号包裹
-4. 字符串值用单引号包裹
-5. 不要包含任何解释性文字，只输出 SQL 语句
-6. 对于 COUNT 类问题，如果用户问的是"不重复的"或"多少种"，使用 COUNT(DISTINCT ...)
-7. 对于列表类问题，使用 SELECT DISTINCT 来去重
-8. 如果有分组统计，使用 GROUP BY
-9. 排序时使用 ORDER BY
-10. 只输出一条 SQL 语句，不要分号结尾
-
-请只输出 SQL，不要输出其他任何内容。"""
+# SQL 生成的系统提示（从 prompts/ 目录加载，支持运行时热更新）
+SQL_GENERATION_SYSTEM_PROMPT = get_prompt("sql_generation_system")
 
 
 class SQLAgent:
@@ -77,7 +61,7 @@ class SQLAgent:
     def __init__(
         self,
         schema_provider: Optional[SchemaProvider] = None,
-        max_retries: int = 2,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         timeout_seconds: int = 30,
     ):
         self.max_retries = max_retries
@@ -91,9 +75,10 @@ class SQLAgent:
         """获取 LLM 实例（懒加载）"""
         if self._llm is None:
             try:
+                llm_cfg = get_llm_config("sql_generate", settings)
                 self._llm = create_llm(
-                    provider=getattr(settings, "rewrite_llm_provider", None) or settings.llm_provider,
-                    model=getattr(settings, "rewrite_llm_model", None) or None,
+                    provider=llm_cfg["provider"],
+                    model=llm_cfg["model"],
                 )
             except Exception as e:
                 logger.warning(f"Failed to create LLM for SQLAgent: {e}")
@@ -368,6 +353,7 @@ class SQLAgent:
             logger.warning("LLM not available for SQL generation")
             return ""
 
+        llm_cfg = get_llm_config("sql_generate", settings)
         schema_summary = self._build_schema_summary(schema, table_name)
 
         try:
@@ -376,9 +362,8 @@ class SQLAgent:
                 system_prompt=SQL_GENERATION_SYSTEM_PROMPT.format(
                     schema_summary=schema_summary
                 ),
-                temperature=0.0,
-                # 推理模型思考会占用 max_tokens，预算过小会拿不到 SQL
-                max_tokens=1500,
+                temperature=llm_cfg["temperature"],
+                max_tokens=llm_cfg["max_tokens"],
             )
 
             sql = self._extract_sql(result)
@@ -662,7 +647,7 @@ class SQLAgent:
     # LLM 修复 SQL
     # ------------------------------------------------------------------
 
-    async def _fix_sql_with_llm(
+    async def _repair_sql_with_llm(
         self,
         query: str,
         sql: str,
@@ -675,6 +660,7 @@ class SQLAgent:
         if llm is None:
             return sql
 
+        llm_cfg = get_llm_config("sql_repair", settings)
         schema_summary = self._build_schema_summary(schema, table_name)
 
         fix_prompt = f"""你是一个专业的 DuckDB SQL 修复助手。
@@ -698,8 +684,8 @@ class SQLAgent:
             result = await llm.simple_chat(
                 prompt="请修复上面的SQL",
                 system_prompt=fix_prompt,
-                temperature=0.0,
-                max_tokens=1500,
+                temperature=llm_cfg["temperature"],
+                max_tokens=llm_cfg["max_tokens"],
             )
 
             fixed_sql = self._extract_sql(result)

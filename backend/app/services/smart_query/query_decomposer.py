@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.providers.llm.factory import create_llm
+from .constants import get_llm_config
+from .prompts import get_prompt
 
 logger = get_logger(__name__)
 
@@ -47,6 +49,7 @@ class DecompositionResult:
     sub_queries: list[SubQuery] = field(default_factory=list)
     is_multi_intent: bool = False  # 是否为多意图问题
     method: str = "single"  # 分解方式：single（无需分解） / rule（规则） / llm（大模型）
+    error: str = ""  # 拆解失败时可直接展示给用户的提示
 
     @property
     def count(self) -> int:
@@ -118,10 +121,10 @@ class QueryDecomposer:
         """获取 LLM 实例（懒加载）"""
         if self._llm is None:
             try:
+                llm_cfg = get_llm_config("decompose", settings)
                 self._llm = create_llm(
-                    provider=getattr(settings, "rewrite_llm_provider", None)
-                    or settings.llm_provider,
-                    model=getattr(settings, "rewrite_llm_model", None) or None,
+                    provider=llm_cfg["provider"],
+                    model=llm_cfg["model"],
                 )
             except Exception as e:
                 logger.warning(f"Failed to create LLM for QueryDecomposer: {e}")
@@ -165,9 +168,12 @@ class QueryDecomposer:
         # 第二步：LLM 分解（仅当规则没判断为多意图时才走）
         # 避免：规则已经判断是单意图了，LLM 又拆成多个
         llm = self._get_llm()
+        failure_message = ""
         if llm is not None:
             try:
                 llm_result = await self._llm_decompose(query, llm)
+                if llm_result is None:
+                    failure_message = "大模型任务拆解失败：模型返回的内容无效。请稍后重试，或将问题拆成多个简单问题分别提问。"
                 if llm_result is not None and llm_result.is_multi_intent:
                     sub_q_names = "、".join([f"「{sq.query}」" for sq in llm_result.sub_queries])
                     logger.info(
@@ -176,7 +182,13 @@ class QueryDecomposer:
                     )
                     return llm_result
             except Exception as e:
-                logger.warning(f"LLM 任务拆解失败：{e}，按单意图处理")
+                logger.warning(f"LLM 任务拆解失败：{e}")
+                failure_message = "大模型任务拆解调用失败，暂时无法处理本次问题。请稍后重试；若持续失败，请联系管理员检查模型服务、API 密钥及额度。"
+        else:
+            failure_message = "大模型任务拆解服务不可用。请联系管理员检查模型配置后重试。"
+
+        if failure_message:
+            return DecompositionResult(original_query=query, method="failed", error=failure_message)
 
         # 第三步：单意图，不分解
         result = DecompositionResult(
@@ -359,40 +371,16 @@ class QueryDecomposer:
 
     async def _llm_decompose(self, query: str, llm: object) -> DecompositionResult | None:
         """使用 LLM 分解复杂问题"""
+        llm_cfg = get_llm_config("decompose", settings)
 
-        system_prompt = """你是一个查询分解专家。你的任务是将用户的问题拆解为独立的子查询，每个子查询对应一个明确的信息需求。
-
-【分解规则】
-1. 如果用户的问题只包含一个信息需求（单意图），不要分解，返回 1 个子查询
-2. 如果包含多个独立的信息需求（多意图），拆成多个子查询
-3. 每个子查询必须是**完整、可独立执行**的问题，不能有指代不清
-4. 子查询之间应该是并列关系，不要有包含或递进关系
-5. 最多拆成 5 个子查询，避免过度分解
-
-【判断多意图的标准】
-- "A以及B"、"A和B各是多少"、"A还有B" → 多意图
-- "A的B和C" → 多意图（A的B、A的C）
-- "A和B的关系" → 单意图（这是一个对比分析需求）
-- "A的B是多少" → 单意图
-
-【输出格式】
-严格按以下 JSON 格式返回，不要输出任何其他内容：
-{
-  "is_multi_intent": true/false,
-  "sub_queries": [
-    {"query": "完整的子问题1", "description": "子问题描述"},
-    {"query": "完整的子问题2", "description": "子问题描述"}
-  ]
-}
-"""
+        system_prompt = get_prompt("decompose_system")
 
         try:
             response = await llm.simple_chat(
                 prompt=f"请分解以下问题：\n\n{query}",
                 system_prompt=system_prompt,
-                temperature=0.1,
-                # 推理模型的思考过程会占用 max_tokens，预算过小会导致 JSON 被截断/为空
-                max_tokens=2048,
+                temperature=llm_cfg["temperature"],
+                max_tokens=llm_cfg["max_tokens"],
             )
 
             logger.debug(f"LLM decomposition raw response for query '{query[:50]}...':\n{response}")
@@ -430,7 +418,7 @@ class QueryDecomposer:
 
         except Exception as e:
             logger.warning(f"LLM decomposition error: {e}")
-            return None
+            raise
 
     def _parse_llm_response(self, response: str) -> dict | None:
         """解析 LLM 返回的 JSON"""

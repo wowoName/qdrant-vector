@@ -15,7 +15,7 @@ Excel 文档处理器
 - Record 模式：语义单元是"行"，查询时结构化 + 语义双路
 - Chunk 模式：保留原有能力，处理长文本表格
 - 流式读取：大文件内存占用低（逐行迭代，不加载全表）
-- Forward Fill：处理合并单元格空值继承
+- Forward Fill：仅对显式配置的列启用，避免跨记录复制空值
 """
 
 import os
@@ -81,7 +81,9 @@ class ExcelProcessor(BaseDocumentProcessor):
         # record 模式下，chunk() 返回 Record 转换的 ChunkItem（兼容旧接口）
         if mode == "record":
             records = await self.records(file_path)
-            chunks = [self._record_to_chunk(r, i) for i, r in enumerate(records)]
+            chunks = []
+            for record in records:
+                chunks.extend(self._record_to_chunks(record, len(chunks)))
             elapsed = time.perf_counter() - t0
             logger.info(
                 f"[ExcelChunker] {file_path}: {elapsed:.2f}s, mode=record, chunks={len(chunks)}"
@@ -128,8 +130,9 @@ class ExcelProcessor(BaseDocumentProcessor):
         if mode == "record":
             idx = 0
             async for record in self.record_stream(file_path):
-                yield self._record_to_chunk(record, idx)
-                idx += 1
+                for chunk in self._record_to_chunks(record, idx):
+                    yield chunk
+                    idx += 1
             return
 
         chunker = self._get_chunker()
@@ -201,7 +204,7 @@ class ExcelProcessor(BaseDocumentProcessor):
         )
         record_count = 0
 
-        if ext in ("xlsx", "xls", "excel"):
+        if ext in ("xlsx", "excel"):
             # 在后台线程中运行同步生成器，通过 asyncio 队列桥接
             async for record in self._sync_gen_to_async(
                 self._record_stream_xlsx_sync, file_path, document_id
@@ -236,20 +239,31 @@ class ExcelProcessor(BaseDocumentProcessor):
         """
         import asyncio
         import threading
-        from queue import Empty, Queue
+        from queue import Empty, Full, Queue
 
         q: Queue = Queue(maxsize=200)
         sentinel = object()
         error_holder: list = []
+        stopped = threading.Event()
+
+        def put(item):
+            while not stopped.is_set():
+                try:
+                    q.put(item, timeout=0.1)
+                    return True
+                except Full:
+                    pass
+            return False
 
         def producer():
             try:
                 for item in sync_gen_func(*args, **kwargs):
-                    q.put(item)
+                    if not put(item):
+                        break
             except Exception as e:
                 error_holder.append(e)
             finally:
-                q.put(sentinel)
+                put(sentinel)
 
         thread = threading.Thread(target=producer, daemon=True)
         thread.start()
@@ -258,8 +272,11 @@ class ExcelProcessor(BaseDocumentProcessor):
 
         try:
             while True:
-                # 先阻塞取第一个
-                first = await loop.run_in_executor(None, q.get)
+                # 有限等待：取消协程不会取消 executor 中正在执行的 q.get。
+                try:
+                    first = await loop.run_in_executor(None, lambda: q.get(timeout=0.1))
+                except Empty:
+                    continue
                 if first is sentinel:
                     break
                 if isinstance(first, Exception):
@@ -287,7 +304,7 @@ class ExcelProcessor(BaseDocumentProcessor):
                 if done:
                     break
         finally:
-            thread.join(timeout=5)
+            stopped.set()
 
         # 检查生产者线程是否有错误
         if error_holder:
@@ -313,6 +330,7 @@ class ExcelProcessor(BaseDocumentProcessor):
         logger.debug(f"[Excel-Perf] Workbook opened in {t_open:.3f}s")
 
         total_records = 0
+        fill_columns = self._get_chunk_config().get("forward_fill_columns", [])
         try:
             sheet_names = wb.sheetnames
             logger.debug(f"[Excel-Perf] Sheets: {len(sheet_names)} - {sheet_names[:5]}...")
@@ -343,10 +361,11 @@ class ExcelProcessor(BaseDocumentProcessor):
                         last_values = [None] * len(headers)
                         continue
 
-                    # Forward Fill（按列填补空值，解决合并单元格问题）
+                    # Only explicitly configured columns may inherit values.
+                    # Blank diagnosis/medication cells must not copy another patient.
                     filled = list(row_strs)
                     for i in range(len(filled)):
-                        if i < len(last_values):
+                        if i < len(last_values) and headers[i] in fill_columns:
                             if not filled[i] and last_values[i] is not None:
                                 filled[i] = last_values[i]
                             elif filled[i]:
@@ -405,7 +424,11 @@ class ExcelProcessor(BaseDocumentProcessor):
         """
         import asyncio
 
-        parse_result = asyncio.get_event_loop().run_until_complete(self.parse(file_path))
+        parser = self._parser
+        if self._detect_type(file_path) == "csv":
+            from app.parsers.csv_parser import CSVParser
+            parser = CSVParser()
+        parse_result = asyncio.run(parser.parse(file_path))
         records = []
         sheet_names = parse_result.metadata.get("sheets", []) if parse_result.metadata else []
 
@@ -621,6 +644,44 @@ class ExcelProcessor(BaseDocumentProcessor):
             char_end=len(record.text),
             page_num=record.metadata.get("sheet_index", 0),
         )
+
+    def _record_to_chunks(self, record: RecordItem, start_index: int) -> list[ChunkItem]:
+        """Keep patients separate; split long records at field/sentence boundaries."""
+        cfg = self._get_chunk_config()
+        size = max(100, int(cfg.get("record_chunk_size", 400)))
+        overlap = max(0, min(int(cfg.get("record_chunk_overlap", 40)), size // 4))
+        if len(record.text) <= size:
+            chunks = [self._record_to_chunk(record, start_index)]
+        else:
+            text = "\n".join(f"{key}：{value}" for key, value in record.data.items() if value != "" and value is not None)
+            # Repeat only compact identifiers; never merge neighbouring records.
+            keys = cfg.get("record_context_columns", ["病历号", "患者编号", "就诊号", "住院号"])
+            context = "；".join(f"{key}：{record.data[key]}" for key in keys if record.data.get(key))[:80]
+            prefix = context + "\n" if context else ""
+            limit = size - len(prefix)
+            chunks = []
+            start = 0
+            while start < len(text):
+                end = min(start + limit, len(text))
+                if end < len(text):
+                    boundary = max(text.rfind(sep, start + limit // 2, end) for sep in ("\n", "。", "；", ";"))
+                    if boundary >= 0:
+                        end = boundary + 1
+                body = text[start:end]
+                chunks.append(ChunkItem(
+                    text=prefix + body, index=start_index + len(chunks),
+                    char_start=start, char_end=end,
+                    page_num=record.metadata.get("sheet_index", 0),
+                ))
+                if end == len(text):
+                    break
+                start = max(start + 1, end - overlap)
+        for part, chunk in enumerate(chunks):
+            chunk.metadata = {
+                "sheet_name": record.sheet_name, "row_number": record.row_number,
+                "record_part": part, "record_parts": len(chunks),
+            }
+        return chunks
 
     def close(self):
         if self._chunker:

@@ -23,7 +23,9 @@ from typing import Optional
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.providers.llm.factory import create_llm
-from app.services.query_state import enforce_removed_columns
+from app.services.query_state import enforce_removed_columns, extract_profile_subject
+from .constants import DEFAULT_MAX_RETRIES, PLAN_CACHE_MAX, get_llm_config
+from .prompts import get_prompt
 from .types import (
     EntityInfo,
     FilterInfo,
@@ -51,7 +53,8 @@ STRUCTURED_KEYWORDS_PATTERNS = [
     # 平均值
     (r"平均|均值|平均值", QueryOperation.AVG),
     # 详情查询（注意："分别是谁/都有谁/都是谁"属于列表类，不在这里匹配）
-    (r"(?<!分别)(?<!都)(?<!各)(?<!还)是谁|(?<!分别)(?<!都)(?<!各)(?<!还)是什么|详细信息|详情|介绍.*下|介绍一下", QueryOperation.DETAIL),
+    # "X的信息" 模式：后面不跟"多少/几个"，避免与统计类混淆
+    (r"(?<!分别)(?<!都)(?<!各)(?<!还)是谁|(?<!分别)(?<!都)(?<!各)(?<!还)是什么|详细信息|详情|介绍.*下|介绍一下|基本信息|个人信息|全部信息|的信息(?![多少几个])", QueryOperation.DETAIL),
     # 是否存在
     (r"有没有|是否有|存在不存在|在不在", QueryOperation.EXISTS),
 ]
@@ -98,15 +101,16 @@ class RouterAgent:
         self._llm = None
         # 查询计划缓存（LLM 规划较贵，相同问句 + 相同表结构可复用）
         self._plan_cache: dict[tuple, QueryPlan] = {}
-        self._plan_cache_max = 512
+        self._plan_cache_max = PLAN_CACHE_MAX
 
     def _get_llm(self):
         """获取 LLM 实例（懒加载）"""
         if self._llm is None:
             try:
+                llm_cfg = get_llm_config("router", settings)
                 self._llm = create_llm(
-                    provider=getattr(settings, "rewrite_llm_provider", None) or settings.llm_provider,
-                    model=getattr(settings, "rewrite_llm_model", None) or None,
+                    provider=llm_cfg["provider"],
+                    model=llm_cfg["model"],
                 )
             except Exception as e:
                 logger.warning(f"Failed to create LLM for RouterAgent: {e}")
@@ -318,7 +322,10 @@ class RouterAgent:
         # 多轮范围继承：仅当当前计划未涉及该列时补上（当前查询显式同列条件优先/覆盖）
         scope_filters = self._scope_filters(inherited_state)
         if scope_filters:
-            self._merge_scope_filters(plan, scope_filters)
+            self._merge_scope_filters(plan, [
+                item for item in scope_filters
+                if isinstance(item, dict) and schema.get_column(str(item.get("column") or ""))
+            ])
 
         # 目标列（DETAIL 查整行详情、EXISTS 判断存在性，均不需要目标列）
         if not plan.target_column and plan.operation not in (
@@ -331,6 +338,13 @@ class RouterAgent:
                 plan.target_column_alias = matched_target.name
 
         self._infer_hierarchy_relation(plan, schema)
+
+        subject = extract_profile_subject(query)
+        if subject and any(f.value == subject and f.source != "inherited" for f in plan.filters):
+            plan.intent = QueryIntent.STRUCTURED
+            plan.operation = QueryOperation.DETAIL
+            plan.needs_sql = True
+            plan.confidence = max(plan.confidence, 0.8)
 
         if plan.operation in (QueryOperation.SUM, QueryOperation.AVG):
             self._infer_numeric_target_for_agg(plan, schema, query)
@@ -587,54 +601,20 @@ class RouterAgent:
         # 构造 schema 摘要（控制 token 数量）
         schema_summary = self._build_schema_summary(schema)
 
-        system_prompt = """你是一个专业的查询分析助手。请根据用户的问题和数据表结构，判断查询意图并生成查询计划。
-
-数据表结构信息：
-{schema_summary}
-
-请分析用户的问题，输出严格的 JSON 格式，包含以下字段：
-{{
-  "intent": "structured | semantic | hybrid | direct_answer",
-  "operation": "count | list | detail | group_count | sum | avg | top_n | group_agg | exists | unknown",
-  "target_column": "要统计或列出的目标列名（从表结构中选择，用原始列名）",
-  "filters": [
-    {{"column": "列名", "operator": "= | != | > | < | >= | <= | LIKE", "value": "过滤值"}}
-  ],
-  "group_by": "分组列名（分组聚合时：要按哪个维度分组，如 业务员/客户/产品）",
-  "metric_column": "度量列名（分组聚合时：被聚合的数值列，如 销售金额）",
-  "agg_func": "sum | avg | count | max | min（分组聚合时的聚合函数，默认 sum）",
-  "order_by": "排序列名",
-  "order_dir": "ASC | DESC",
-  "limit": 0,
-  "confidence": 0.0到1.0之间的置信度,
-  "reasoning": "你的分析推理过程"
-}}
-
-注意事项：
-1. intent 取值说明：
-   - structured: 可以直接用 SQL 回答的结构化查询（统计、列表、精确匹配）
-   - semantic: 需要语义理解的查询（解释、描述、模糊查找）
-   - hybrid: 既有结构化条件又有语义条件的混合查询
-   - direct_answer: 不需要检索数据就能直接回答的问题（问候、系统问题等）
-2. 只输出 JSON，不要有其他解释性文字
-3. 如果无法确定 target_column 或 filters，留空字符串或空数组
-4. 所有列名必须从给定的表结构中选择，使用原始列名
-5. confidence 表示你对这个分析结果的把握程度
-6. reasoning 请用一句话简述（40 字以内），避免输出过长导致 JSON 被截断"""
-
+        system_prompt = get_prompt("router_system")
         user_prompt = f"用户问题：{query}"
         formatted_system_prompt = system_prompt.format(schema_summary=schema_summary)
 
         # 规划模型偶发返回空串/非 JSON（模型抖动），这里带重试；连续失败才回退规则
-        max_attempts = 2
+        max_attempts = DEFAULT_MAX_RETRIES
         for attempt in range(1, max_attempts + 1):
             try:
+                llm_cfg = get_llm_config("router", settings)
                 result = await llm.simple_chat(
                     prompt=user_prompt,
                     system_prompt=formatted_system_prompt,
-                    temperature=0.1,
-                    # 推理模型的思考过程会占用 max_tokens（此前 800 会把规划 JSON 截断）
-                    max_tokens=2048,
+                    temperature=llm_cfg["temperature"],
+                    max_tokens=llm_cfg["max_tokens"],
                 )
             except Exception as e:
                 logger.warning(f"LLM planning call failed (attempt {attempt}/{max_attempts}): {e}")

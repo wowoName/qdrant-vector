@@ -41,7 +41,7 @@ cp .env.example .env
 ### 启动
 
 ```bash
-uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uv run python -m app.main
 ```
 
 访问 http://localhost:8000/docs 查看 API 文档。
@@ -76,3 +76,5 @@ backend/
 | Search | `/api/v1/collections/{id}/search` | 语义检索 |
 | Tasks | `/api/v1/tasks` | 任务管理 |
 | System | `/api/v1/system` | 系统接口 |
+
+Windows 启动：在 backend 目录运行 `uv run python -m app.main`，或从项目根目录运行 `powershell -ExecutionPolicy Bypass -File .\backend\start.ps1`。不要添加 `--reload` 或多个 workers；入口已选择本机数据库写入所需的事件循环。

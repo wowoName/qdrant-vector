@@ -10,13 +10,14 @@ from app.api.deps import get_current_user, get_db, get_visible_ids
 from app.core.chat_database import get_chat_db
 from app.models.db.user import UserDB
 from app.models.schemas.chat import ChatRequest
-from app.models.schemas.common import success, paginated
+from app.models.schemas.common import paginated, success
 from app.services.chat_service import ChatService
 
 router = APIRouter(tags=["Chat"])
 
 
 # ========== 独立对话接口（不强制绑定知识库） ==========
+
 
 @router.post("/chat", summary="对话问答（非流式，不传知识库则搜索全部）")
 async def chat_ask_global(
@@ -112,6 +113,7 @@ async def list_all_conversations(
 
 # ========== 查询明细导出下载 ==========
 
+
 @router.get("/chat/exports/{filename}", summary="下载查询明细导出文件")
 async def download_query_export(
     filename: str,
@@ -141,6 +143,7 @@ async def download_query_export(
 
 
 # ========== 按知识库分组的对话接口（兼容旧版） ==========
+
 
 @router.post("/collections/{collection_id}/chat", summary="对话问答（非流式）")
 async def chat_ask(

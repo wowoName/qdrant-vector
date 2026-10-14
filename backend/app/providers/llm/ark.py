@@ -99,7 +99,7 @@ class ArkLLM(OpenAICompatibleLLM):
             if "InvalidEndpointOrModel.NotFound" in msg:
                 raise RuntimeError(
                     f"火山方舟模型不存在或无权限：{self._model}。"
-                    f"请检查 ARK_MODEL_ENDPOINT 配置，"
+                    f"请检查 LLM_MODEL 或对应场景的 *_LLM_MODEL 配置，"
                     f"需使用控制台的 Model ID（如 doubao-seed-2-1-pro-260628）"
                     f"或 Endpoint ID（ep-xxxxx），不能使用展示名。"
                 ) from e
@@ -120,7 +120,7 @@ class ArkLLM(OpenAICompatibleLLM):
             if "InvalidEndpointOrModel.NotFound" in msg:
                 raise RuntimeError(
                     f"火山方舟模型不存在或无权限：{self._model}。"
-                    f"请检查 ARK_MODEL_ENDPOINT 配置，"
+                    f"请检查 LLM_MODEL 或对应场景的 *_LLM_MODEL 配置，"
                     f"需使用控制台的 Model ID（如 doubao-seed-2-1-pro-260628）"
                     f"或 Endpoint ID（ep-xxxxx），不能使用展示名。"
                 ) from e

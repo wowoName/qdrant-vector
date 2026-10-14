@@ -2,7 +2,7 @@
 分块器工厂
 """
 
-from app.core.config import settings
+from app.core.config import settings, get_chunk_config, get_tabular_config
 
 from .base import BaseChunker
 from .fixed_size_chunker import FixedSizeChunker
@@ -32,27 +32,25 @@ def get_chunker(strategy: str | None = None, file_type: str | None = None) -> Ba
         strategy: 切片策略
         file_type: 文件类型（用于 auto 模式自动选择切片器）
     """
-    strategy = (strategy or settings.chunk_strategy).lower()
-
-    # auto 模式：根据文件类型自动选择
-    if strategy == "auto" and file_type:
-        if file_type.lower() in TABULAR_FILE_TYPES:
-            return TabularChunker()
-        return RecursiveChunker()
-
+    cfg = get_chunk_config(file_type)
+    strategy = (strategy or cfg["strategy"]).lower()
+    if strategy == "auto":
+        strategy = "tabular" if file_type and file_type.lower() in TABULAR_FILE_TYPES else "recursive"
+    params = {"chunk_size": cfg["size"], "chunk_overlap": cfg["overlap"], "min_size": cfg["min_size"]}
     if strategy in ("tabular", "table", "excel", "row"):
-        return TabularChunker()
-    elif strategy == "fixed":
-        return FixedSizeChunker()
-    elif strategy in ("recursive", "recursive_character"):
-        return RecursiveChunker()
-    elif strategy == "semantic":
-        return SemanticChunker()
-    elif strategy in ("parent_child", "hybrid", "parent-child"):
-        return ParentChildChunker()
-    else:
-        # 默认递归分块
-        return RecursiveChunker()
+        table_cfg = get_tabular_config(file_type)
+        return TabularChunker(
+            mode=table_cfg["mode"], rows_per_chunk=table_cfg["rows_per_chunk"],
+            columns_per_group=table_cfg["columns_per_group"], include_headers=table_cfg["include_headers"],
+            chunk_size=cfg["size"], chunk_overlap=cfg["overlap"],
+        )
+    if strategy == "fixed":
+        return FixedSizeChunker(**params)
+    if strategy == "semantic":
+        return SemanticChunker(**params)
+    if strategy in ("parent_child", "hybrid", "parent-child"):
+        return ParentChildChunker(**params)
+    return RecursiveChunker(**params)
 
 
 def get_chunker_for_file(file_type: str, strategy: str | None = None) -> BaseChunker:
@@ -75,6 +73,6 @@ def get_chunker_for_file(file_type: str, strategy: str | None = None) -> BaseChu
 
     # 自动选择
     if file_type and file_type.lower() in TABULAR_FILE_TYPES:
-        return TabularChunker()
+        return get_chunker(strategy="tabular", file_type=file_type)
 
     return get_chunker(strategy=strategy, file_type=file_type)

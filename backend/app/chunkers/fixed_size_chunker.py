@@ -17,9 +17,9 @@ class FixedSizeChunker(BaseChunker):
         chunk_overlap: int = None,
         min_size: int = None,
     ):
-        self.chunk_size = chunk_size or settings.chunk_size
-        self.chunk_overlap = chunk_overlap or settings.chunk_overlap
-        self.min_size = min_size or settings.chunk_min_size
+        self.chunk_size = settings.chunk_size if chunk_size is None else chunk_size
+        self.chunk_overlap = settings.chunk_overlap if chunk_overlap is None else chunk_overlap
+        self.min_size = settings.chunk_min_size if min_size is None else min_size
         self._sentence_ends = "。！？.!?\n"
 
     def chunk(self, text: str) -> List[ChunkItem]:
@@ -29,6 +29,8 @@ class FixedSizeChunker(BaseChunker):
         """流式固定大小分块"""
         if not text:
             return
+        if self.chunk_size < 1 or not 0 <= self.chunk_overlap < self.chunk_size:
+            raise ValueError("overlap must be smaller than positive chunk_size")
         if len(text) <= self.min_size:
             yield ChunkItem(text=text, index=0, char_start=0, char_end=len(text))
             return
@@ -52,8 +54,8 @@ class FixedSizeChunker(BaseChunker):
                         break
                 end = split_pos
 
-            chunk_text = text[start:end].strip()
-            if chunk_text and len(chunk_text) >= self.min_size:
+            chunk_text = text[start:end]
+            if chunk_text.strip():
                 yield ChunkItem(
                     text=chunk_text,
                     index=idx,
@@ -64,9 +66,7 @@ class FixedSizeChunker(BaseChunker):
 
             if end >= text_len:
                 break
-            start = end - self.chunk_overlap
-            if start >= text_len or start < end - size:
-                start = end
+            start = max(start + 1, end - self.chunk_overlap)
 
     def _find_split_point(self, text: str, start: int, end: int) -> int:
         """在 [start, end] 范围内找最近的句子结束位置"""

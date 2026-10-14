@@ -175,7 +175,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -567,11 +567,18 @@ function formatDate(date: string) {
   return formatAppTime(date)
 }
 
+let refreshTimer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
   fetchCollectionInfo()
   fetchDirectories()
   fetchDocuments()
+  refreshTimer = setInterval(() => {
+    if (!loading.value && documents.value.some(doc => ['pending', 'processing'].includes(doc.status))) {
+      fetchDocuments()
+    }
+  }, 2000)
 })
+onUnmounted(() => clearInterval(refreshTimer))
 </script>
 
 <style scoped>

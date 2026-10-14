@@ -160,11 +160,11 @@ def fix_line_breaks(text: str) -> str:
 
 
 def clean_pdf_text(text: str) -> str:
-    """PDF 文本清洗流水线"""
-    text = normalize_text(text)
-    lines = text.splitlines()
-    lines = remove_headers_footers(lines)
-    text = "\n".join(lines)
-    text = fix_line_breaks(text)
-    text = clean_whitespace(text)
-    return text
+    """Conservative PDF cleaning: keep numbers, repeated content and line layout.
+
+    Page furniture cannot be inferred from a single page's text. NFKC also
+    changes scientific superscripts/units. Never delete or join content here.
+    """
+    text = unicodedata.normalize("NFC", text).replace("\x00", "")
+    text = re.sub(r"[\u200b\ufeff]", "", text)
+    return text.strip()

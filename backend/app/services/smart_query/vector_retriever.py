@@ -35,13 +35,14 @@ class VectorRetriever(BaseRetriever):
         vector_service: Optional[VectorService] = None,
         retrieval_agent: Optional[RetrievalAgent] = None,
         db=None,
+        visible_ids: list[str] | None = None,
     ):
         if retrieval_agent:
             self.retrieval_agent = retrieval_agent
         elif vector_service:
-            self.retrieval_agent = RetrievalAgent(vector_service=vector_service)
+            self.retrieval_agent = RetrievalAgent(vector_service=vector_service, visible_ids=visible_ids)
         elif db is not None:
-            self.retrieval_agent = RetrievalAgent(db=db)
+            self.retrieval_agent = RetrievalAgent(db=db, visible_ids=visible_ids)
         else:
             raise ValueError("必须提供 vector_service / retrieval_agent / db 之一")
 
@@ -87,7 +88,8 @@ class VectorRetriever(BaseRetriever):
                 query=query,
                 collection_id=effective_collection,
                 top_k=top_k,
-                document_id=schema.document_id if schema.document_id else None,
+                # The primary SQL table is not a user-requested document scope.
+                document_id=None,
             )
 
             if result.success and result.results:
@@ -105,6 +107,7 @@ class VectorRetriever(BaseRetriever):
                             "chunk_index": r.get("chunk_index", 0),
                             "document_name": r.get("document_name", ""),
                             "file_type": r.get("file_type", ""),
+                            "collection_id": r.get("collection_id", ""),
                         },
                         metadata={
                             "page_num": r.get("page_num", 0),

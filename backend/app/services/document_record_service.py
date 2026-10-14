@@ -13,12 +13,14 @@
 """
 
 import uuid
+from collections.abc import Awaitable, Callable
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chunkers.base import RecordItem
 from app.core.logging import get_logger
+from app.models.db.document import DocumentDB
 from app.models.db.document_record import DocumentRecordDB
 from app.processors.excel_processor import ExcelProcessor
 from app.repositories.record_repo import RecordRepository
@@ -51,6 +53,7 @@ class DocumentRecordService:
         document_id: str,
         version_id: str,
         batch_size: int = 500,
+        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> int:
         """
         将 Excel 文件导入为结构化记录
@@ -71,6 +74,15 @@ class DocumentRecordService:
         total = 0
         batch: list[DocumentRecordDB] = []
 
+        # Records are the current document snapshot (the unique key and all
+        # readers are document-scoped). Replace it atomically on upload/retry.
+        # Keep the delete and inserts in this transaction so a failed import
+        # restores the previous snapshot when the caller rolls back.
+        await self.db.execute(
+            select(DocumentDB.id).where(DocumentDB.id == document_id).with_for_update()
+        )
+        await self.record_repo.delete_by_document(document_id)
+
         async for record_item in processor.record_stream(file_path, document_id):
             db_record = self._to_db_record(record_item, document_id, version_id)
             batch.append(db_record)
@@ -80,11 +92,15 @@ class DocumentRecordService:
                 total += len(batch)
                 batch = []
                 logger.info(f"Import progress: {total} records")
+                if on_progress:
+                    await on_progress(total)
 
         # 写入剩余
         if batch:
             await self.record_repo.bulk_insert(batch, batch_size=batch_size)
             total += len(batch)
+            if on_progress:
+                await on_progress(total)
 
         # 一致性校验：流式读取到的行数必须与实际落库行数一致。
         # 不一致说明入库过程中发生了静默丢行，会导致后续结构化查询（SUM/COUNT）少算数据，

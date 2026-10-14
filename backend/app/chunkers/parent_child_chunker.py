@@ -71,9 +71,9 @@ class ParentChildChunker(BaseChunker):
         parent_overlap: int = None,
         context_prefix: bool = True,  # 是否给子块注入父块上下文前缀
     ):
-        self.chunk_size = chunk_size or settings.chunk_size
-        self.chunk_overlap = chunk_overlap or settings.chunk_overlap
-        self.min_size = min_size or settings.chunk_min_size
+        self.chunk_size = settings.chunk_size if chunk_size is None else chunk_size
+        self.chunk_overlap = settings.chunk_overlap if chunk_overlap is None else chunk_overlap
+        self.min_size = settings.chunk_min_size if min_size is None else min_size
         self.parent_size = parent_size or getattr(settings, "chunk_parent_size", 1500)
         self.parent_overlap = parent_overlap or getattr(settings, "chunk_parent_overlap", 200)
         self.context_prefix = context_prefix

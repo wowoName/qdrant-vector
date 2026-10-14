@@ -87,11 +87,11 @@ cp .env.example .env
 
 # 方式一：使用 uv（推荐）
 uv sync
-uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uv run python -m app.main
 
 # 方式二：使用 pip
 pip install -r ../requirements.txt
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m app.main
 ```
 
 启动后访问：
@@ -158,3 +158,5 @@ npm run build      # 产物输出至 frontend/dist/
 - 🚀 **任务系统**：异步任务队列，进度追踪
 - 🔍 **语义检索**：向量相似度搜索
 - 💬 **RAG 对话**：多 LLM Provider 支持，上下文压缩与会话热存储
+
+Windows 启动：在 backend 目录运行 `uv run python -m app.main`，或从项目根目录运行 `powershell -ExecutionPolicy Bypass -File .\backend\start.ps1`。不要添加 `--reload` 或多个 workers；入口已选择本机数据库写入所需的事件循环。

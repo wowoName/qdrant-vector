@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     db_max_overflow: int = 10
     # 连接池中连接的回收时间（秒），防止连接长时间闲置后失效
     db_pool_recycle: int = 3600
+    # 数据库命令超时，包含驱动等待，避免后台任务无限挂起。
+    db_command_timeout: float = 60.0
 
     # ---------- 对话数据库配置（对话记录：会话/消息/摘要） ----------
     # 不配置则使用主库（默认行为），配置后对话数据独立存储
@@ -111,6 +113,10 @@ class Settings(BaseSettings):
     # 父子块：父块大小与重叠
     chunk_parent_size: int = 1500
     chunk_parent_overlap: int = 200
+    # PDF: preserve native text; use OCR only for image-only/sparse scanned pages.
+    pdf_ocr_enabled: bool = True
+    pdf_ocr_dpi: int = 150
+    pdf_extract_tables: bool = True
 
     # 表格专用切片配置（TabularChunker / Record 模式）
     # 模式: record（记录模式，一行一个，精度最高但最慢）
@@ -133,8 +139,8 @@ class Settings(BaseSettings):
     # 格式：{ "file_type": { "strategy": "...", "size": N, "overlap": N, "min_size": N } }
     #
     # 设计理念：
-    # - Excel/CSV：语义单元是"行"，按行切，不受字符数限制
-    # - PDF/DOCX：语义单元是"段落"，按结构切，字符数较大
+    # - Excel/CSV：原始记录按行保存，长记录分片，入库前按模型 token 预算校验
+    # - PDF/DOCX：按页/段落切，400 字符起步，入库前再按模型 token 预算校验
     # - Markdown：语义单元是"标题块"，按 markdown 结构切
     # - 普通文本：按字符数切
     per_type_chunk_config: dict = {
@@ -157,61 +163,61 @@ class Settings(BaseSettings):
             "rows_per_chunk": 10,
             "include_headers": True,
         },
-        # ---- 富文本类：按结构切，字符数较大 ----
+        # ---- 富文本类：按结构切，适配短上下文嵌入模型 ----
         "pdf": {
             "strategy": "recursive",
-            "size": 800,
-            "overlap": 80,
-            "min_size": 100,
+            "size": 400,
+            "overlap": 40,
+            "min_size": 50,
         },
         "docx": {
             "strategy": "recursive",
-            "size": 800,
-            "overlap": 80,
-            "min_size": 100,
+            "size": 400,
+            "overlap": 40,
+            "min_size": 50,
         },
         "doc": {
             "strategy": "recursive",
-            "size": 800,
-            "overlap": 80,
-            "min_size": 100,
+            "size": 400,
+            "overlap": 40,
+            "min_size": 50,
         },
         "pptx": {
             "strategy": "recursive",
-            "size": 600,
-            "overlap": 50,
+            "size": 400,
+            "overlap": 40,
             "min_size": 50,
         },
         "ppt": {
             "strategy": "recursive",
-            "size": 600,
-            "overlap": 50,
+            "size": 400,
+            "overlap": 40,
             "min_size": 50,
         },
         # ---- 轻量文本类：按标题结构切 ----
         "md": {
             "strategy": "recursive",
-            "size": 600,
-            "overlap": 60,
-            "min_size": 80,
+            "size": 400,
+            "overlap": 40,
+            "min_size": 50,
         },
         "markdown": {
             "strategy": "recursive",
-            "size": 600,
-            "overlap": 60,
-            "min_size": 80,
+            "size": 400,
+            "overlap": 40,
+            "min_size": 50,
         },
         "html": {
             "strategy": "recursive",
-            "size": 600,
-            "overlap": 60,
-            "min_size": 80,
+            "size": 400,
+            "overlap": 40,
+            "min_size": 50,
         },
         "htm": {
             "strategy": "recursive",
-            "size": 600,
-            "overlap": 60,
-            "min_size": 80,
+            "size": 400,
+            "overlap": 40,
+            "min_size": 50,
         },
         # ---- 纯文本：默认全局配置（无需特殊指定） ----
         # "txt": {}  # 不配置则使用全局默认
@@ -301,7 +307,6 @@ class Settings(BaseSettings):
     # 火山方舟 (Ark)
     ark_api_key: str | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
-    ark_model_endpoint: str | None = None
 
     # Ollama
     ollama_base_url: str = "http://localhost:11434"

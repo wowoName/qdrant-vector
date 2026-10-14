@@ -1947,7 +1947,6 @@ QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 # Ark（字节火山引擎）
 ARK_API_KEY=
 ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
-ARK_MODEL_ENDPOINT=
 
 # Ollama
 OLLAMA_BASE_URL=http://localhost:11434

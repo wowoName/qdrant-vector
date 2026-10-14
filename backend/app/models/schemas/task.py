@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 class TaskResponse(BaseModel):
     id: str
     type: str
+    file_name: Optional[str] = None
     status: str
     priority: int
     progress: float = 0.0

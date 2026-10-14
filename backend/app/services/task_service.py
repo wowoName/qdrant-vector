@@ -43,6 +43,9 @@ class TaskService:
         self._cancel_cache: dict[str, tuple[bool, float]] = {}
         self._cancel_cache_ttl = 1.0  # 缓存 1 秒，取消操作本身就不要求毫秒级响应
 
+    def is_worker_shutdown(self) -> bool:
+        return _shutting_down
+
     async def create_task(
         self,
         task_type: str,
@@ -132,58 +135,67 @@ class TaskService:
         task.progress = new_progress
         if detail is not None:
             # 合并 detail，保留已有字段
-            if task.progress_detail and isinstance(task.progress_detail, dict):
-                task.progress_detail.update(detail)
-            else:
-                task.progress_detail = detail
+            task.progress_detail = {**(task.progress_detail or {}), **detail}
         await self.db.commit()
 
     async def run_task(self, task_id: str) -> None:
         """执行任务（在后台任务中调用）"""
         task = await self.get_task(task_id)
+        if task.status not in ("pending", "queued", "running"):
+            return
+        # A failed flush expires ORM attributes. Error handling must only use
+        # these plain values until the broken transaction has been rolled back.
+        task_type = task.type
+        payload = dict(task.payload or {})
         task.status = "running"
+        task.progress = 0.0
+        task.progress_detail = {"stage": "starting"}
+        task.error_message = None
         task.started_at = now()
+        task.completed_at = None
         await self.db.commit()
 
-        handler = _task_handlers.get(task.type)
-        if not handler:
-            task.status = "failed"
-            task.error_message = f"No handler registered for task type: {task.type}"
-            task.completed_at = now()
-            await self.db.commit()
-            return
-
+        handler = _task_handlers.get(task_type)
         try:
-            logger.info(f"Task starting: {task.id} ({task.type})")
-            result = await handler(task.payload, task.id, self)
+            if not handler:
+                raise RuntimeError(f"No handler registered for task type: {task_type}")
+            logger.info(f"Task starting: {task_id} ({task_type})")
+            result = await handler(payload, task_id, self)
             # 完成前再次检查是否被取消
-            if await self.is_task_cancelled(task.id):
+            if await self.is_task_cancelled(task_id):
                 raise asyncio.CancelledError()
             task.status = "completed"
             task.progress = 1.0
             task.result = result
             task.completed_at = now()
             await self.db.commit()
-            logger.info(f"Task completed: {task.id}")
+            logger.info(f"Task completed: {task_id}")
         except asyncio.CancelledError:
-            logger.info(f"Task cancelled during execution: {task.id}")
+            logger.info(f"Task cancelled during execution: {task_id}")
+            # 先结束当前事务，避免在失败/被取消的事务上继续写入状态。
+            try:
+                await self.db.rollback()
+            except Exception:
+                logger.warning(f"Failed to roll back interrupted task {task_id}", exc_info=True)
+            # Hot reload/shutdown is an interruption, not a user's cancellation.
+            # Leave it recoverable by start_task_workers on the next startup.
+            status = "pending" if self.is_worker_shutdown() else "cancelled"
             # 当前 session 可能已失效（cancel 发生在 DB await 中时），用 fallback 更新状态
             ok = await self._update_status_with_fallback(
-                task.id,
-                "cancelled",
-                completed_at=now(),
+                task_id,
+                status,
+                completed_at=None if status == "pending" else now(),
             )
             if not ok:
                 logger.warning(
-                    f"Could not persist cancelled status for task {task.id}. "
+                    f"Could not persist cancelled status for task {task_id}. "
                     f"Will be recovered on next startup."
                 )
             raise  # 继续抛出，让上层 worker 知道
         except Exception as e:
-            logger.error(f"Task failed: {task.id}, error: {e}")
+            logger.error(f"Task failed: {task_id}, error: {e}")
             logger.error(traceback.format_exc())
 
-            task_id = task.id
             error_msg = str(e)[:500]
 
             # 确保 session 状态干净（出错时可能有未提交的脏数据）
@@ -254,6 +266,8 @@ class TaskService:
                         "tid": task_id,
                     },
                 )
+                if task_type == "document_process":
+                    await self._set_document_failure(payload, error_msg, new_status == "failed")
                 await self.db.commit()
             except Exception as ex:
                 logger.error(f"Failed to update task status: {ex}")
@@ -261,11 +275,36 @@ class TaskService:
 
             if new_status == "pending":
                 # 稍后重试：把任务放回队列
-                asyncio.create_task(self._delayed_retry(task_id))
+                retry_task = asyncio.create_task(self._delayed_retry(task_id), name=f"task-retry-{task_id}")
+                _retry_tasks.add(retry_task)
+                retry_task.add_done_callback(_retry_tasks.discard)
+
+    async def _set_document_failure(self, payload: dict, error: str, terminal: bool) -> None:
+        """Keep document/version status aligned with the processing task."""
+        from sqlalchemy import text
+
+        params = {
+            "vid": payload.get("version_id"), "did": payload.get("document_id"),
+            "status": "failed" if terminal else "processing", "error": error,
+        }
+        await self.db.execute(text("""
+            UPDATE document_versions SET status = :status, error_message = :error
+            WHERE id = :vid AND document_id = :did
+        """), params)
+        # An older task must not overwrite the state of a newer upload.
+        await self.db.execute(text("""
+            UPDATE documents SET status = :status, error_message = :error
+            WHERE id = :did AND :vid = (
+                SELECT id FROM document_versions WHERE document_id = :did
+                ORDER BY version_num DESC LIMIT 1
+            )
+        """), params)
 
     async def _delayed_retry(self, task_id: str) -> None:
         """延迟重试：把任务重新放回队列，由 worker 用新的 session 执行"""
         await asyncio.sleep(settings.task_retry_delay)
+        if _shutting_down:
+            return
         try:
             await _task_queue.put(task_id)
             logger.info(f"Task requeued for retry: {task_id}")
@@ -324,6 +363,9 @@ class TaskService:
 
     async def check_cancelled(self, task_id: str) -> None:
         """检查任务是否已取消，如果已取消则抛出异常中止任务"""
+        if self.is_worker_shutdown():
+            # 在批次边界退出，不向正在执行的数据库操作注入取消。
+            raise asyncio.CancelledError("Worker shutdown")
         if await self.is_task_cancelled(task_id):
             logger.info(f"Task {task_id} was cancelled, aborting...")
             raise asyncio.CancelledError(f"Task {task_id} was cancelled")
@@ -373,12 +415,14 @@ class TaskService:
 
 _task_queue: asyncio.Queue = asyncio.Queue()
 _worker_tasks: list[asyncio.Task] = []
+_retry_tasks: set[asyncio.Task] = set()
 _running = False
+_shutting_down = False
 
 
 async def start_task_workers(db_session_factory) -> None:
     """启动后台任务 Worker"""
-    global _running, _worker_tasks
+    global _running, _worker_tasks, _shutting_down
     if _running:
         return
 
@@ -386,6 +430,7 @@ async def start_task_workers(db_session_factory) -> None:
     import app.tasks  # noqa: F401
 
     _running = True
+    _shutting_down = False
     logger.info(f"Starting {settings.task_max_workers} task workers...")
     logger.info(f"Registered task handlers: {list(_task_handlers.keys())}")
 
@@ -416,38 +461,66 @@ async def start_task_workers(db_session_factory) -> None:
         while _running:
             try:
                 task_id = await _task_queue.get()
-                if task_id is None:
+                if task_id is None or not _running:
+                    _task_queue.task_done()
                     break
 
                 # 每个任务创建独立的 DB session
-                async with db_session_factory() as session:
-                    service = TaskService(session, session_factory=db_session_factory)
-                    try:
-                        await service.run_task(task_id)
-                    except asyncio.CancelledError:
-                        # 任务被取消，状态已在 run_task 里用 fallback 尝试更新
-                        logger.info(f"Worker {worker_id}: task {task_id} cancelled")
-                    except Exception as e:
-                        logger.error(f"Worker {worker_id} error: {e}")
-                _task_queue.task_done()
+                try:
+                    async with db_session_factory() as session:
+                        service = TaskService(session, session_factory=db_session_factory)
+                        try:
+                            await service.run_task(task_id)
+                        except asyncio.CancelledError:
+                            logger.info(f"Worker {worker_id}: task {task_id} cancelled")
+                            if _shutting_down:
+                                raise
+                        except Exception as e:
+                            logger.error(f"Worker {worker_id} error: {e}")
+                finally:
+                    _task_queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Worker {worker_id} unexpected error: {e}")
                 await asyncio.sleep(1)
 
-    _worker_tasks = [asyncio.create_task(worker(i)) for i in range(settings.task_max_workers)]
+    _worker_tasks = [asyncio.create_task(worker(i), name=f"task-worker-{i}") for i in range(settings.task_max_workers)]
 
 
-async def stop_task_workers() -> None:
+async def stop_task_workers(timeout: float = 10.0) -> None:
     """停止任务 Worker"""
-    global _running
+    global _running, _shutting_down
+    _shutting_down = True
     _running = False
-    for _ in _worker_tasks:
-        await _task_queue.put(None)
-    for t in _worker_tasks:
+    tasks = set(_worker_tasks) | _retry_tasks
+    for t in _retry_tasks:
         t.cancel()
-    await asyncio.gather(*_worker_tasks, return_exceptions=True)
+    # 唤醒空闲 Worker；运行中的 Worker 在下一次 check_cancelled 时退出。
+    for _ in _worker_tasks:
+        _task_queue.put_nowait(None)
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for t in done:
+            if not t.cancelled():
+                t.exception()  # 读取异常，避免未处理任务告警
+        if pending:
+            for t in pending:
+                stack = t.get_stack()
+                location = ", ".join(f"{frame.f_code.co_filename}:{frame.f_lineno}" for frame in stack)
+                logger.warning(f"Graceful shutdown timed out waiting for {t.get_name()}: {location}; cancelling task")
+                t.cancel()
+            # 只强制取消一次，留出事务回滚和连接关闭时间，避免再次打断清理。
+            _, pending = await asyncio.wait(pending, timeout=timeout)
+            if pending:
+                logger.error(f"Workers still pending after cancellation: {[t.get_name() for t in pending]}")
+                raise TimeoutError("Task workers did not finish shutdown cleanup")
+    _worker_tasks.clear()
+    _retry_tasks.clear()
+    # 未执行的任务已持久化，下次启动会重新入队，清除旧队列避免重复执行。
+    while not _task_queue.empty():
+        _task_queue.get_nowait()
+        _task_queue.task_done()
     logger.info("All task workers stopped")
 
 
